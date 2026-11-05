@@ -3,17 +3,18 @@ CUBIOMES_SRC := $(addprefix cubiomes/,biomenoise.c biomes.c finders.c generator.
 LARGE_BIOMES ?= 0
 UNBOUND ?= 0
 
-ifeq (UNBOUND, 1)
-	BIN_SUFFIX += u
+ifeq ($(UNBOUND),1)
+	BIN_SUFFIX := u
 endif
 
-ifeq (LARGE_BIOMES, 1)
-	BIN_SUFFIX += lb
+ifeq ($(LARGE_BIOMES),1)
+	BIN_SUFFIX := $(BIN_SUFFIX)lb
 else
-	BIN_SUFFIX += sb
+	BIN_SUFFIX := $(BIN_SUFFIX)sb
 endif
 
 PRINT_INTERVAL ?= 256
+MAX_ITERS ?= 0
 # Auto-detect GPU architecture:
 # - RTX 40xx/50xx series: sm_89 is faster than native sm_120
 # - Everything else: use native
@@ -31,7 +32,7 @@ endif
 
 $(info Using ARCH = $(ARCH))
 override CFLAGS += -O3
-override CXXFLAGS += -O3 -std=c++20 -I asio/asio/include -DOMISSION_LARGE_BIOMES=$(LARGE_BIOMES) -DOMISSION_UNBOUND=$(UNBOUND) -DPRINT_INTERVAL=$(PRINT_INTERVAL)
+override CXXFLAGS += -O3 -std=c++20 -I asio/asio/include -DOMISSION_LARGE_BIOMES=$(LARGE_BIOMES) -DOMISSION_UNBOUND=$(UNBOUND) -DPRINT_INTERVAL=$(PRINT_INTERVAL) -DMAX_ITERS=$(MAX_ITERS)
 override NVCC_FLAGS += $(CXXFLAGS) --expt-relaxed-constexpr --default-stream per-thread -arch=$(ARCH) -use_fast_math
 
 ifeq ($(OS),Windows_NT)

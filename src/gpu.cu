@@ -1760,7 +1760,7 @@ void GpuThread::run() {
 
   auto start = std::chrono::steady_clock::now();
 
-  for (uint32_t i = 0; !should_stop(); i++) {
+  for (uint32_t i = 0; !should_stop() && (MAX_ITERS == 0 || i < MAX_ITERS); i++) {
     uint64_t start_seed = input.next(KernelFilterSeeds::threads_per_run);
 
     TRY_CUDA(cudaMemsetAsync(device_buffer_lens, 0, sizeof(*device_buffer_lens), stream));
@@ -1920,4 +1920,10 @@ void GpuThread::run() {
 
   TRY_CUDA(cudaStreamDestroy(stream));
   TRY_CUDA(cudaFree(device_buffer_lens));
+
+  if constexpr (MAX_ITERS != 0) {
+    // benchmark build: fixed number of pipeline iterations, then exit the process
+    std::fflush(stdout);
+    std::_Exit(0);
+  }
 }

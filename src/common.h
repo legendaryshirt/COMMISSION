@@ -23,6 +23,10 @@ constexpr bool unbound = true;
 constexpr bool unbound = false;
 #endif
 
+#ifndef MAX_ITERS
+#define MAX_ITERS 0
+#endif
+
 #ifndef PRINT_INTERVAL
 #define PRINT_INTERVAL 256
 #endif
