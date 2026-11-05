@@ -15,6 +15,14 @@ endif
 
 PRINT_INTERVAL ?= 256
 MAX_ITERS ?= 0
+# SEED_ORDER=golden: logical index n -> seed (n*GOLDEN)^SILVER; ~1 mix64/seed instead of 2.
+# Changes which seeds a --start range covers (still a bijection) and the net handshake.
+SEED_ORDER ?= linear
+ifeq ($(SEED_ORDER),golden)
+  SEED_ORDER_GOLDEN := 1
+else
+  SEED_ORDER_GOLDEN := 0
+endif
 # Auto-detect GPU architecture:
 # - RTX 40xx/50xx series: sm_89 is faster than native sm_120
 # - Everything else: use native
@@ -32,7 +40,7 @@ endif
 
 $(info Using ARCH = $(ARCH))
 override CFLAGS += -O3
-override CXXFLAGS += -O3 -std=c++20 -I asio/asio/include -DOMISSION_LARGE_BIOMES=$(LARGE_BIOMES) -DOMISSION_UNBOUND=$(UNBOUND) -DPRINT_INTERVAL=$(PRINT_INTERVAL) -DMAX_ITERS=$(MAX_ITERS)
+override CXXFLAGS += -O3 -std=c++20 -I asio/asio/include -DOMISSION_LARGE_BIOMES=$(LARGE_BIOMES) -DOMISSION_UNBOUND=$(UNBOUND) -DPRINT_INTERVAL=$(PRINT_INTERVAL) -DMAX_ITERS=$(MAX_ITERS) -DSEED_ORDER_GOLDEN=$(SEED_ORDER_GOLDEN)
 override NVCC_FLAGS += $(CXXFLAGS) --expt-relaxed-constexpr --default-stream per-thread -arch=$(ARCH) -use_fast_math
 
 ifeq ($(OS),Windows_NT)

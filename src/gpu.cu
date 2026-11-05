@@ -297,6 +297,15 @@ template <typename T> struct InputBuffer {
   InputBuffer(const InputBuffer<T> &other) : data(other.data), len(other.len) {}
 };
 
+__device__ inline XrsrRandomFork XrsrRandom_seed_fork_from_mix(uint64_t l, uint64_t h) {
+  uint64_t r1 = XrsrRandom::rol64(l + h, 17) + l;
+  h ^= l;
+  uint64_t l2 = XrsrRandom::rol64(l, 49) ^ h ^ (h << 21);
+  uint64_t h2 = XrsrRandom::rol64(h, 28);
+  uint64_t r2 = XrsrRandom::rol64(l2 + h2, 17) + l2;
+  return { r1, r2 };
+}
+
 __device__ inline XrsrRandomFork XrsrRandom_seed_fork(uint64_t seed) {
   seed ^= XrsrRandom::XRSR_SILVER_RATIO;
   uint64_t l = XrsrRandom::mix64(seed);
@@ -377,13 +386,11 @@ __device__ float octave_yo_mod1(const XrsrRandomFork &noise_yo_fork) {
   return ((r >> 32) & 0xFFFFFF) * 5.9604645E-8f;
 }
 
-__global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed, OutputBuffer<uint64_t> outputs) {
+// Tests one seed given l = mix64(seed ^ SILVER) and h = mix64((seed ^ SILVER) + GOLDEN).
+__device__ __forceinline__ void filter_one(uint64_t seed, uint64_t l, uint64_t h, OutputBuffer<uint64_t> &outputs) {
   constexpr float maxScore = 0.038f; // 0.045f, 0.035f, 0.03f, 0.025f  ==  1 in 2700, 9400, 26000, 54000
 
-  uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  uint64_t seed = start_seed + index;
-
-  const auto seed_fork = XrsrRandom_seed_fork(seed);
+  const auto seed_fork = XrsrRandom_seed_fork_from_mix(l, h);
   auto noise_random = seed_fork.from(device_chosen_continentalness_config.fork_hash);
 
   const auto noise_a_yo_fork = noise_yo_fork(noise_random.fork());
@@ -432,8 +439,52 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
   outputs.data[result_index] = seed;
 }
 
+
+#if SEED_ORDER_GOLDEN
+// Logical index n maps to seed (n * GOLDEN) ^ SILVER (a bijection: GOLDEN is odd). Then
+// seed n's second mix64 is seed n+1's first, so a thread walking consecutive n pays one
+// mix64 per seed instead of two. SEED_CHAIN_STRAIGHT=1 computes the same seeds with two
+// mixes each, as a reference for checking the chained version.
+#ifndef SEED_CHAIN
+#define SEED_CHAIN 16
+#endif
+#ifndef SEED_CHAIN_STRAIGHT
+#define SEED_CHAIN_STRAIGHT 0
+#endif
+constexpr uint32_t chain = SEED_CHAIN;
+static_assert(threads_per_run % (threads_per_block * chain) == 0);
+
+__global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed, OutputBuffer<uint64_t> outputs) {
+  const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  uint64_t x = (start_seed + (uint64_t)index * chain) * XrsrRandom::XRSR_GOLDEN_RATIO;
+#if SEED_CHAIN_STRAIGHT
+  for (uint32_t k = 0; k < chain; k++, x += XrsrRandom::XRSR_GOLDEN_RATIO) {
+    filter_one(x ^ XrsrRandom::XRSR_SILVER_RATIO, XrsrRandom::mix64(x), XrsrRandom::mix64(x + XrsrRandom::XRSR_GOLDEN_RATIO), outputs);
+  }
+#else
+  uint64_t l = XrsrRandom::mix64(x);
+  for (uint32_t k = 0; k < chain; k++) {
+    const uint64_t seed = x ^ XrsrRandom::XRSR_SILVER_RATIO;
+    x += XrsrRandom::XRSR_GOLDEN_RATIO;
+    const uint64_t h = XrsrRandom::mix64(x);
+    filter_one(seed, l, h, outputs);
+    l = h;
+  }
+#endif
+}
+constexpr uint32_t threads_launched = threads_per_run / chain;
+#else
+__global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed, OutputBuffer<uint64_t> outputs) {
+  uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  uint64_t seed = start_seed + index;
+  uint64_t x = seed ^ XrsrRandom::XRSR_SILVER_RATIO;
+  filter_one(seed, XrsrRandom::mix64(x), XrsrRandom::mix64(x + XrsrRandom::XRSR_GOLDEN_RATIO), outputs);
+}
+constexpr uint32_t threads_launched = threads_per_run;
+#endif
+
 void run(uint64_t start_seed, OutputBuffer<uint64_t> outputs, cudaStream_t stream) {
-  kernel<<<threads_per_run / threads_per_block, threads_per_block, 0, stream>>>(start_seed, outputs);
+  kernel<<<threads_launched / threads_per_block, threads_per_block, 0, stream>>>(start_seed, outputs);
   TRY_CUDA(cudaGetLastError());
 }
 } // namespace KernelFilterSeeds

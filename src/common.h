@@ -23,6 +23,10 @@ constexpr bool unbound = true;
 constexpr bool unbound = false;
 #endif
 
+#ifndef SEED_ORDER_GOLDEN
+#define SEED_ORDER_GOLDEN 0
+#endif
+
 #ifndef MAX_ITERS
 #define MAX_ITERS 0
 #endif
@@ -31,7 +35,7 @@ constexpr bool unbound = false;
 #define PRINT_INTERVAL 256
 #endif
 
-constexpr std::array<char, 16> net_handshake { 'O', 'M', 'I', 'S', 'S', 'I', 'O', 'N', '-', 'G', 'P', 'U', ' ', large_biomes ? 'L' : 'S', 'B', '\n' };
+constexpr std::array<char, 16> net_handshake { 'O', 'M', 'I', 'S', 'S', 'I', 'O', 'N', '-', 'G', 'P', SEED_ORDER_GOLDEN ? 'Z' : 'U', ' ', large_biomes ? 'L' : 'S', 'B', '\n' };
 
 struct GpuOutput {
     uint64_t seed;
