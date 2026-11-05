@@ -13,7 +13,7 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | gv1 same, single 256-row table + index mask | 2096 | 2705 | 1428 | 6825 | 20.14 | rejected (ALU-bound: the mask costs more than the smem it saves) |
 | `SEED_ORDER=golden` straight reference (2 mix64/seed, same seeds) | 2094 | 2324 | 1431 | 6449 | 21.31 | reference for the next row |
 | `SEED_ORDER=golden`, chain 8 (1 mix64/seed) | 1942 | 2322 | 1430 | 6293 | 21.84 | counts identical to reference |
-| `SEED_ORDER=golden`, chain 16 | 1925 | — | — | 6274 | 21.91 | **kept as opt-in: −8.1% seeds, +2.6% total** (4: 6324, 32: 6270) |
+| `SEED_ORDER=golden`, chain 16 | 1925 | — | — | 6274 | 21.91 | **kept, now the DEFAULT (2026-11-05): −8.1% seeds, +2.6% total** (4: 6324, 32: 6270) |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
@@ -23,7 +23,7 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
   figure, moving gradDot from shared memory to the ALU lost 57%, so the ALU is what's scarce
   on Ada. Shared-table lookups are cheap here.
 
-## SEED_ORDER=golden (opt-in, `make SEED_ORDER=golden`)
+## SEED_ORDER=golden (default; `make SEED_ORDER=linear` restores upstream order)
 Logical index n maps to seed (n·GOLDEN) ^ SILVER. That's a bijection on 64-bit space because
 GOLDEN is odd, so coverage stays complete and non-overlapping. The point is that seed n's
 `hi` mix64 equals seed n+1's `lo` mix64, so a thread walking 16 consecutive n pays 17 mixes

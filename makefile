@@ -15,9 +15,9 @@ endif
 
 PRINT_INTERVAL ?= 256
 MAX_ITERS ?= 0
-# SEED_ORDER=golden: logical index n -> seed (n*GOLDEN)^SILVER; ~1 mix64/seed instead of 2.
+# SEED_ORDER=golden (default): logical index n -> seed (n*GOLDEN)^SILVER; ~1 mix64/seed instead of 2.
 # Changes which seeds a --start range covers (still a bijection) and the net handshake.
-SEED_ORDER ?= linear
+SEED_ORDER ?= golden
 ifeq ($(SEED_ORDER),golden)
   SEED_ORDER_GOLDEN := 1
 else

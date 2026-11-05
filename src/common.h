@@ -24,7 +24,7 @@ constexpr bool unbound = false;
 #endif
 
 #ifndef SEED_ORDER_GOLDEN
-#define SEED_ORDER_GOLDEN 0
+#define SEED_ORDER_GOLDEN 1
 #endif
 
 #ifndef MAX_ITERS
