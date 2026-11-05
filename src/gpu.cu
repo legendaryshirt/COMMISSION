@@ -733,7 +733,25 @@ __device__ __forceinline__ float score_full_12(
 
 namespace KernelFilterGradVecs1 {
 constexpr uint32_t block_dim_x = 256;
+#ifndef GV1_ROWS
+#define GV1_ROWS 512
+#endif
+// 512: table duplicated (index v + nz <= 510 needs no mask); 256: single copy, index masked.
+constexpr uint32_t conv_rows = GV1_ROWS;
+static_assert(conv_rows == 256 || conv_rows == 512);
 
+__device__ __forceinline__ uint32_t conv_index(uint32_t v, uint32_t nz) {
+  if constexpr (conv_rows == 512) return v + nz;
+  else return (v + nz) & 0xFF;
+}
+
+// Conv tables are stored column-major. Within a warp the row index is v + nz with v
+// warp-uniform and nz = lane, so every load is unit-stride across lanes (bank-conflict
+// free). Row-major [513][6] put lanes 24 B apart: a 2-way bank conflict on every load.
+// Columns 2 and 3 (the gate columns) are packed as float2: candidate c needs column 2 at
+// w[c+2] and column 3 at w[c+3], so one 8-byte load at w[j] serves column 2 of candidate
+// j-2 and column 3 of candidate j-3 -> 9 loads per row per 8 candidates instead of 16.
+// Summation order matches the original score_center_2x2 / score_full_12 exactly.
 __global__
 __launch_bounds__(block_dim_x) void kernel(
     const InputBuffer<uint64_t> seeds,
@@ -743,8 +761,10 @@ __launch_bounds__(block_dim_x) void kernel(
   __shared__ alignas(16) ImprovedNoise oct_0A;
   __shared__ alignas(16) float shared_kernel_0A[6][6][16][2];
 
-  __shared__ float conv_z0[513][6];
-  __shared__ float conv_z1[513][6];
+  __shared__ float conv0[4][conv_rows]; // columns 0, 1, 4, 5 of y-row 0
+  __shared__ float conv1[4][conv_rows]; // columns 0, 1, 4, 5 of y-row 1
+  __shared__ float2 pk0[conv_rows];     // columns 2, 3 of y-row 0
+  __shared__ float2 pk1[conv_rows];     // columns 2, 3 of y-row 1
 
   __shared__ alignas(16) uint8_t idx_xy[2][272];
 
@@ -773,22 +793,29 @@ __launch_bounds__(block_dim_x) void kernel(
         p_z[dnz] = oct_0A.p[(nz + dnz) & 0xFF] & 0xF;
       }
 
+      float c0[6], c1[6];
 #pragma unroll
       for (int32_t dnx = 0; dnx < 6; ++dnx) {
-        float conv0 = 0.0f;
-        float conv1 = 0.0f;
+        float conv0_acc = 0.0f;
+        float conv1_acc = 0.0f;
 
 #pragma unroll
         for (int32_t dnz = 0; dnz < 6; ++dnz) {
           const uint32_t p = p_z[dnz];
-          conv0 += shared_kernel_0A[dnx][dnz][p][0];
-          conv1 += shared_kernel_0A[dnx][dnz][p][1];
+          conv0_acc += shared_kernel_0A[dnx][dnz][p][0];
+          conv1_acc += shared_kernel_0A[dnx][dnz][p][1];
         }
+        c0[dnx] = conv0_acc;
+        c1[dnx] = conv1_acc;
+      }
 
-        conv_z0[nz][dnx] = conv0;
-        conv_z1[nz][dnx] = conv1;
-        conv_z0[nz + 256][dnx] = conv0;
-        conv_z1[nz + 256][dnx] = conv1;
+#pragma unroll
+      for (uint32_t copy = 0; copy < conv_rows / 256; ++copy) {
+        const uint32_t r = nz + copy * 256;
+        conv0[0][r] = c0[0]; conv0[1][r] = c0[1]; conv0[2][r] = c0[4]; conv0[3][r] = c0[5];
+        conv1[0][r] = c1[0]; conv1[1][r] = c1[1]; conv1[2][r] = c1[4]; conv1[3][r] = c1[5];
+        pk0[r] = make_float2(c0[2], c0[3]);
+        pk1[r] = make_float2(c1[2], c1[3]);
       }
     }
 
@@ -824,26 +851,41 @@ __launch_bounds__(block_dim_x) void kernel(
       uchar4 c1_2 = *reinterpret_cast<const uchar4*>(&idx_xy[1][nx + 8]);
       uchar4 c1_3 = *reinterpret_cast<const uchar4*>(&idx_xy[1][nx + 12]);
 
-      uint16_t w0[13];
-      w0[0]  = c0_0.x + nz; w0[1]  = c0_0.y + nz; w0[2]  = c0_0.z + nz; w0[3]  = c0_0.w + nz;
-      w0[4]  = c0_1.x + nz; w0[5]  = c0_1.y + nz; w0[6]  = c0_1.z + nz; w0[7]  = c0_1.w + nz;
-      w0[8]  = c0_2.x + nz; w0[9]  = c0_2.y + nz; w0[10] = c0_2.z + nz; w0[11] = c0_2.w + nz;
-      w0[12] = c0_3.x + nz;
+      const uint8_t r0[13] = {c0_0.x, c0_0.y, c0_0.z, c0_0.w, c0_1.x, c0_1.y, c0_1.z, c0_1.w,
+                              c0_2.x, c0_2.y, c0_2.z, c0_2.w, c0_3.x};
+      const uint8_t r1[13] = {c1_0.x, c1_0.y, c1_0.z, c1_0.w, c1_1.x, c1_1.y, c1_1.z, c1_1.w,
+                              c1_2.x, c1_2.y, c1_2.z, c1_2.w, c1_3.x};
+      uint32_t w0[13], w1[13];
+#pragma unroll
+      for (int j = 0; j < 13; ++j) {
+        w0[j] = conv_index(r0[j], nz);
+        w1[j] = conv_index(r1[j], nz);
+      }
 
-      uint16_t w1[13];
-      w1[0]  = c1_0.x + nz; w1[1]  = c1_0.y + nz; w1[2]  = c1_0.z + nz; w1[3]  = c1_0.w + nz;
-      w1[4]  = c1_1.x + nz; w1[5]  = c1_1.y + nz; w1[6]  = c1_1.z + nz; w1[7]  = c1_1.w + nz;
-      w1[8]  = c1_2.x + nz; w1[9]  = c1_2.y + nz; w1[10] = c1_2.z + nz; w1[11] = c1_2.w + nz;
-      w1[12] = c1_3.x + nz;
+      float2 g0[9], g1[9];
+#pragma unroll
+      for (int j = 0; j < 9; ++j) {
+        g0[j] = pk0[w0[j + 2]];
+        g1[j] = pk1[w1[j + 2]];
+      }
 
 #pragma unroll
       for (int candidate = 0; candidate < 8; ++candidate) {
-        const uint16_t* cw0 = &w0[candidate];
-        const uint16_t* cw1 = &w1[candidate];
-
-        const float gate = score_center_2x2(conv_z0, conv_z1, cw0, cw1);
+        const float gate = g0[candidate].x + g0[candidate + 1].y + g1[candidate].x + g1[candidate + 1].y;
         if (gate >= kGradVecs1PrefilterThreshold) {
-          const float score = score_full_12(conv_z0, conv_z1, cw0, cw1);
+          float score = 0.0f;
+          score += conv0[0][w0[candidate]];
+          score += conv1[0][w1[candidate]];
+          score += conv0[1][w0[candidate + 1]];
+          score += conv1[1][w1[candidate + 1]];
+          score += g0[candidate].x;
+          score += g1[candidate].x;
+          score += g0[candidate + 1].y;
+          score += g1[candidate + 1].y;
+          score += conv0[2][w0[candidate + 4]];
+          score += conv1[2][w1[candidate + 4]];
+          score += conv0[3][w0[candidate + 5]];
+          score += conv1[3][w1[candidate + 5]];
           if (score > kGradVecs1FinalThreshold) {
             uint32_t res_idx = atomicAdd(outputs.len, 1);
             if (res_idx < outputs.max_len) {
