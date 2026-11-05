@@ -24,7 +24,7 @@ close_session() {   # record the range covered by a finished or killed previous 
     end=$(awk '/^start_seed = /{s=$3} END{if (s!="") print s}' "$LOG")
     [ -n "$end" ] && end=$((end + BATCH))
   fi
-  found=$(wc -l < search/current.found 2>/dev/null || echo 0)
+  found=$(grep -c . search/current.found 2>/dev/null || true); found=${found:-0}
   [ -n "$first" ] && [ -n "$end" ] && printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$key" "$first" "$end" "$found" >> "$LEDGER"
   cat search/current.found >> search/found.txt 2>/dev/null || true
   mv "$LOG" "search/session-$(date +%s).log"; rm -f search/current.found
