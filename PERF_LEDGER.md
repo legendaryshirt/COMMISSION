@@ -53,3 +53,12 @@ small biomes, bounded, min size 10M, logical start 2^62. On the node: islands go
 `cnode stop commission-search`, then `ssh compute 'cd COMMISSION && tools/search.sh close'`
 to log the range. Or just restart it, since the next run closes the previous session itself.
 Collect with `cnode pull search`.
+
+## Host-side candidate dedup (2026-11-05)
+Before a candidate is queued for CPU verification, it's dropped if one of the last 64 queued
+candidates has the same seed and lies within 1024 blocks in both x and z. The CPU window is ±12800.
+Check: a 120 s run at --size 2000000 printed 12 lines / 12 unique islands, against 32 lines /
+23 unique before. 4 candidates were dropped.
+**Still owed:** a fixed-work check. Time-limited runs verify a different subset (the single CPU
+thread is the bottleneck), so the unique counts above aren't comparable. Run identical seeds with
+the CPU queue fully drained, with and without dedup, and confirm the unique island sets match.

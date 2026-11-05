@@ -7,6 +7,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -1787,6 +1788,9 @@ void GpuThread::run() {
   DeviceBuffer buffer_1(UINT32_C(1) << 31);
   DeviceBuffer buffer_2(UINT32_C(1) << 29);
   std::vector<SeedPos> h_buffer;
+  std::array<GpuOutput, 64> recent_outputs{};
+  size_t recent_next = 0;
+  uint64_t deduped_outputs = 0;
   std::vector<StageStats> stage_stats;
   stage_stats.reserve(16);
 
@@ -1942,7 +1946,24 @@ void GpuThread::run() {
         for (const auto &result : h_buffer) {
           uint64_t seed;
           TRY_CUDA(cudaMemcpy(&seed, &outputs_filter_seeds.data[result.seed_index], sizeof(seed), cudaMemcpyDeviceToHost));
-          outputs.queue.push({seed, result.x * 4, result.z * 4});
+          const GpuOutput out{seed, result.x * 4, result.z * 4};
+          // Neighbouring GPU candidates often land on the same island; verifying each one
+          // repeats the CPU work and printed duplicate lines. 1024 blocks is far inside the
+          // CPU's +-12800-block verification window, so both would get the same verdict.
+          bool duplicate = false;
+          for (size_t r = 0; r < std::min(recent_next, recent_outputs.size()); r++) {
+            const auto &prev = recent_outputs[r];
+            if (prev.seed == out.seed && std::abs(prev.x - out.x) <= 1024 && std::abs(prev.z - out.z) <= 1024) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (duplicate) {
+            deduped_outputs++;
+            continue;
+          }
+          recent_outputs[recent_next++ % recent_outputs.size()] = out;
+          outputs.queue.push(out);
         }
       }
     }
@@ -2002,7 +2023,7 @@ void GpuThread::run() {
         std::lock_guard lock(outputs.mutex);
         gpu_outputs_size = outputs.queue.size();
       }
-      std::printf("gpu_outputs.size() = %zu\n", gpu_outputs_size);
+      std::printf("gpu_outputs.size() = %zu (duplicates dropped so far: %" PRIu64 ")\n", gpu_outputs_size, deduped_outputs);
 
       for (auto &stage_stat : stage_stats) {
         stage_stat.reset();
