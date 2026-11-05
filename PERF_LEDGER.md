@@ -39,3 +39,6 @@ The gain is only +2.6% because mix64 is about 30% of filter_seeds; the fork/rota
 - The same island is emitted 2-3x (neighbouring GPU candidates hit it), so CPU verification
   is repeated and output.txt gets duplicate lines. A host-side dedup ring before the CPU queue
   would fix this.
+
+## Pending job
+`cnode job commission-order-stats` (started 2026-11-05): linear vs golden, 16384 iterations each (~4.4 T seeds), stage pass rates. Collect with `cnode pull order-stats.txt`; the 1-in-N columns should agree within noise.
