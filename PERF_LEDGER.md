@@ -42,3 +42,14 @@ The gain is only +2.6% because mix64 is about 30% of filter_seeds; the fork/rota
 
 ## Pending job
 `cnode job commission-order-stats` (started 2026-11-05): linear vs golden, 16384 iterations each (~4.4 T seeds), stage pass rates. Collect with `cnode pull order-stats.txt`; the 1-in-N columns should agree within noise.
+Result (4.4 T seeds each): stage pass rates agree to 4 significant figures (filter_seeds 1 in 6285.29
+vs 6285.05, gv1 3708.97 vs 3708.97, 2_01a 257.02 vs 257.14). Finals 65 vs 49 is a 1.5 sigma Poisson
+difference, so not significant. Golden total 21.81 vs 21.27 G seeds/s (+2.5%).
+
+## Live search
+`cnode job commission-search 'tools/search.sh'` (started 2026-11-05 ~23:30Z). It's golden,
+small biomes, bounded, min size 10M, logical start 2^62. On the node: islands go to
+`search/current.found`, covered ranges to `search/ranges.tsv` once a session closes. To stop:
+`cnode stop commission-search`, then `ssh compute 'cd COMMISSION && tools/search.sh close'`
+to log the range. Or just restart it, since the next run closes the previous session itself.
+Collect with `cnode pull search`.
