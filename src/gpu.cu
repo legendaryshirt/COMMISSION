@@ -122,64 +122,46 @@ __device__ constexpr auto continentalness_large_config = make_normal_noise_confi
 __device__ constexpr auto chosen_continentalness_config = large_biomes ? continentalness_large_config : continentalness_config;
 __device__ constexpr auto device_chosen_continentalness_config = chosen_continentalness_config;
 
+#ifndef GRAD_PACKED
+#define GRAD_PACKED 1
+#endif
+#if GRAD_PACKED
+// One 32-bit word per hash. Byte k holds the top byte of the float 2*g_k (g_k in {-1,0,1}):
+// +2.0 = 0x40000000, -2.0 = 0xC0000000, 0 = 0, so one __byte_perm rebuilds each component.
+// The noise kernels are LSU-bound (Ada issues ~0.5 LSU warp-instr/clk/SM); this turns 3 shared
+// loads per corner into 1. gradDot returns exactly 2x the true value (power-of-two scaling is
+// exact), and every caller folds the 0.5 into its octave weight, so results are bit-identical.
+struct GradDotTable {
+  uint32_t g[16];
+};
+constexpr float grad_scale_comp = 0.5f;
+#else
 struct GradDotTable {
   float x[16];
   float y[16];
   float z[16];
 };
+constexpr float grad_scale_comp = 1.0f;
+#endif
 
 __device__ GradDotTable device_grad_dot_table;
 
 void init_grad_dot_table() {
+  static const int8_t g[16][3] = {
+      {1, 1, 0},  {-1, 1, 0},  {1, -1, 0}, {-1, -1, 0}, {1, 0, 1},  {-1, 0, 1},  {1, 0, -1}, {-1, 0, -1},
+      {0, 1, 1},  {0, -1, 1},  {0, 1, -1}, {0, -1, -1}, {1, 1, 0},  {0, -1, 1},  {-1, 1, 0}, {0, -1, -1},
+  };
   GradDotTable table;
-  table.x[0] = 1;
-  table.y[0] = 1;
-  table.z[0] = 0; // { 1,  1,  0}
-  table.x[1] = -1;
-  table.y[1] = 1;
-  table.z[1] = 0; // {-1,  1,  0}
-  table.x[2] = 1;
-  table.y[2] = -1;
-  table.z[2] = 0; // { 1, -1,  0}
-  table.x[3] = -1;
-  table.y[3] = -1;
-  table.z[3] = 0; // {-1, -1,  0}
-  table.x[4] = 1;
-  table.y[4] = 0;
-  table.z[4] = 1; // { 1,  0,  1}
-  table.x[5] = -1;
-  table.y[5] = 0;
-  table.z[5] = 1; // {-1,  0,  1}
-  table.x[6] = 1;
-  table.y[6] = 0;
-  table.z[6] = -1; // { 1,  0, -1}
-  table.x[7] = -1;
-  table.y[7] = 0;
-  table.z[7] = -1; // {-1,  0, -1}
-  table.x[8] = 0;
-  table.y[8] = 1;
-  table.z[8] = 1; // { 0,  1,  1}
-  table.x[9] = 0;
-  table.y[9] = -1;
-  table.z[9] = 1; // { 0, -1,  1}
-  table.x[10] = 0;
-  table.y[10] = 1;
-  table.z[10] = -1; // { 0,  1, -1}
-  table.x[11] = 0;
-  table.y[11] = -1;
-  table.z[11] = -1; // { 0, -1, -1}
-  table.x[12] = 1;
-  table.y[12] = 1;
-  table.z[12] = 0; // { 1,  1,  0}
-  table.x[13] = 0;
-  table.y[13] = -1;
-  table.z[13] = 1; // { 0, -1,  1}
-  table.x[14] = -1;
-  table.y[14] = 1;
-  table.z[14] = 0; // {-1,  1,  0}
-  table.x[15] = 0;
-  table.y[15] = -1;
-  table.z[15] = -1; // { 0, -1, -1}
+  for (int h = 0; h < 16; h++) {
+#if GRAD_PACKED
+    auto enc = [](int v) -> uint32_t { return v > 0 ? 0x40u : (v < 0 ? 0xC0u : 0u); };
+    table.g[h] = enc(g[h][0]) | (enc(g[h][1]) << 8) | (enc(g[h][2]) << 16);
+#else
+    table.x[h] = g[h][0];
+    table.y[h] = g[h][1];
+    table.z[h] = g[h][2];
+#endif
+  }
 
   void *device_grad_dot_table_addr;
   TRY_CUDA(cudaGetSymbolAddress(&device_grad_dot_table_addr, device_grad_dot_table));
@@ -188,7 +170,15 @@ void init_grad_dot_table() {
 
 __forceinline__ __device__ float gradDot(const GradDotTable &table, uint8_t p, float x, float y, float z) {
   const uint32_t hash = p & 0xF;
+#if GRAD_PACKED
+  const uint32_t w = table.g[hash];
+  const float gx = __uint_as_float(__byte_perm(w, 0, 0x0444));
+  const float gy = __uint_as_float(__byte_perm(w, 0, 0x1444));
+  const float gz = __uint_as_float(__byte_perm(w, 0, 0x2444));
+  return fmaf(x, gx, fmaf(y, gy, z * gz));
+#else
   return fmaf(x, table.x[hash], fmaf(y, table.y[hash], z * table.z[hash]));
+#endif
 }
 
 __forceinline__ __device__ float smoothstep(float value) {
@@ -244,7 +234,7 @@ __device__ float wrap(float value) {
 
 template <OctaveConfig config>
 __forceinline__ __device__ float sample_octave(const GradDotTable &table, const ImprovedNoise &noise, int32_t x, int32_t y, int32_t z) {
-  return sample_noise(table, noise, wrap(x * (float)config.input_factor), wrap(y * (float)config.input_factor), wrap(z * (float)config.input_factor)) * (float)config.value_factor;
+  return sample_noise(table, noise, wrap(x * (float)config.input_factor), wrap(y * (float)config.input_factor), wrap(z * (float)config.input_factor)) * ((float)config.value_factor * grad_scale_comp);
 }
 
 __device__ void init_noise(ImprovedNoise &noise, XrsrRandom &&random) {
@@ -1348,8 +1338,8 @@ constexpr OctaveConfig cfg0 = chosen_continentalness_config.octaves_a[0];
 constexpr OctaveConfig cfg1 = chosen_continentalness_config.octaves_a[1];
 constexpr float if0 = (float)cfg0.input_factor;
 constexpr float if1 = (float)cfg1.input_factor;
-constexpr float vf0 = (float)cfg0.value_factor;
-constexpr float vf1 = (float)cfg1.value_factor;
+constexpr float vf0 = (float)cfg0.value_factor * grad_scale_comp;
+constexpr float vf1 = (float)cfg1.value_factor * grad_scale_comp;
 
 __device__ inline void compute_cell(const ImprovedNoise &noise, int32_t int_x, int32_t int_y, int32_t int_z, uint8_t &c000, uint8_t &c100, uint8_t &c010, uint8_t &c110, uint8_t &c001, uint8_t &c101, uint8_t &c011, uint8_t &c111) {
   uint8_t p0 = noise.p[(int_x) & 0xFF];
@@ -1515,8 +1505,8 @@ constexpr OctaveConfig cfg0 = chosen_continentalness_config.octaves_b[0];
 constexpr OctaveConfig cfg1 = chosen_continentalness_config.octaves_b[1];
 constexpr float if0 = (float)cfg0.input_factor;
 constexpr float if1 = (float)cfg1.input_factor;
-constexpr float vf0 = (float)cfg0.value_factor;
-constexpr float vf1 = (float)cfg1.value_factor;
+constexpr float vf0 = (float)cfg0.value_factor * grad_scale_comp;
+constexpr float vf1 = (float)cfg1.value_factor * grad_scale_comp;
 
 __device__ inline void compute_cell(const ImprovedNoise &noise, int32_t int_x, int32_t int_y, int32_t int_z, uint8_t &c000, uint8_t &c100, uint8_t &c010, uint8_t &c110, uint8_t &c001, uint8_t &c101, uint8_t &c011, uint8_t &c111) {
   uint8_t p0 = noise.p[(int_x) & 0xFF];

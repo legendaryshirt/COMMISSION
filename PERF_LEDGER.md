@@ -16,6 +16,8 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | `SEED_ORDER=golden`, chain 16 | 1925 | — | — | 6274 | 21.91 | **kept, now the DEFAULT (2026-11-05): −8.1% seeds, +2.6% total** (4: 6324, 32: 6270) |
 | gv1 256-row masked + `__launch_bounds__(256,4)` (≤64 regs, 4 blocks/SM) | — | 2672 | — | 6805 | 20.20 | rejected (+18% gv1 vs 2261 same-session ref) |
 | gv1 256-row masked + minBlocks 5 / 6 | — | 5690 / 16768 | — | 9820 / 20886 | 13.99 / 6.58 | rejected: register spills. gv1 isn't latency-bound, so occupancy doesn't help |
+| f2_01a/b: linear-in-x cell evaluation (F2_LINX) | — | — | 1444 | 6393 | 21.50 | rejected: no gain, count drift of 1. Removes ALU only, and the kernel is LSU-bound |
+| **gradDot packed table: 1 shared load per corner instead of 3 (byte-encoded ±2.0)** | — | — | **1115** (ref 1427) | **6053** (ref 6365) | **22.71** | **kept: 2_01a −22%, 2_01b −20%, 2a −22%, total −4.9%, all counts byte-identical** |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
@@ -72,3 +74,12 @@ the CPU queue fully drained, with and without dedup, and confirm the unique isla
 Note (2026-11-06): the unchanged gv1 512-row config measured 2261 ms in this session, against 2317
 on 2026-11-05: a 2.4% clock/thermal drift between sessions. Only compare against a same-session
 reference row.
+
+## Why filter_2_01a is LSU-bound (ncu, 2026-11-06)
+LSU pipe 98.9%, issue 65%. Ada issues about 0.5 LSU warp-instructions per clock per SM, so
+the ~290 shared loads per warp-input outweigh ~1590 total instructions / 4 schedulers. nvcc had
+already hoisted the gradient-table loads into the cell-change branch: dynamic shared loads were
+216.3 M with or without F2_LINX. So only fewer loads per cell help. The packed table cuts each
+corner from 3 loads to 1 and rebuilds the components with `__byte_perm`. It stores 2*g, which is
+exact; callers multiply the octave weight by 0.5, which is also exact.
+Remaining LSU per cell: 6 uniform p[] loads + 8 corner p[] loads + 8 table loads.
