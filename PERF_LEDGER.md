@@ -25,6 +25,7 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | FS_COMPACT, chain 32 / 64 / 128 / 256 | 1715 / 1695 / 1690 / 1698 | — | — | 5586 / 5559 / 5555 / 5562 | 24.60 / **24.72** / 24.74 / 24.71 | **chain 64 is the default** (plateau) |
 | gv1: gate pass bits as a predicate mask + one warp `any` (GV1_MASK) | — | 2246 (ref 2258) | — | 5550 (ref 5559) | 24.77 | kept: −0.5% gv1, exact |
 | gv1: uint32 pre-scaled gate offsets via broadcast LDS.128 (GV1_IDX32) | — | 2926 (ref 2246) | — | 6219 | 22.10 | **rejected, +30% gv1** |
+| f2: pair table extended with gradient words (uint2 per entry, 7 LDS per cell instead of 15; F2_G2) | — | — | 1134 (ref 1023) | 5667 (ref 5547) | 24.25 | **rejected, +11% 2_01a**: build cost (9 LDS + 4 STS.128 per lane per octave) and 5 KB/warp smem (33% occupancy) outweigh it |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
@@ -110,3 +111,9 @@ With 21.7% passing the first test, P(some lane of 32 passes) = 99.96%, so under 
 every lane paid for the second-stage forks. Survivors are now queued per warp in shared memory and
 re-run 32 at a time; the dense pass repeats the cheap first test and recomputes the 2 mix64s. A
 longer chain amortizes the flush of the partial queue at the end.
+
+## Where things stand (2026-11-06)
+All three hot kernels are at a measured hardware limit for their current algorithms:
+filter_seeds on ALU-pipe integer ops, gv1 on issue/LSU (balanced), filter_2_01a on LSU issue
+(balanced against ALU issue). Every remaining idea tried costs as much as it saves. Further big
+gains would need a different algorithm (e.g. a cheaper exact pre-test in front of gv1), not tuning.
