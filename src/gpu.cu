@@ -344,6 +344,9 @@ __device__ inline void XrsrRandom_double_fork(XrsrRandom &rng, XrsrRandomFork &f
   fork_b = { r3, r4 };
 }
 
+#ifndef FS_FAST
+#define FS_FAST 1
+#endif
 namespace KernelFilterSeeds {
 constexpr uint32_t threads_per_block = 256;
 constexpr uint32_t threads_per_run = UINT64_C(1) << 28; //28
@@ -375,7 +378,11 @@ __device__ float octave_yo_mod1(const XrsrRandomFork &noise_yo_fork) {
   uint64_t h = noise_yo_fork.hi ^ fork_hash.hi;
   uint64_t r = XrsrRandom::rol64(l + h, 17) + l;
   
+#if FS_FAST
+  return (float)(uint32_t)((r >> 32) & 0xFFFFFF) * 5.9604645E-8f; // 24-bit value: U32 convert is exact
+#else
   return ((r >> 32) & 0xFFFFFF) * 5.9604645E-8f;
+#endif
 }
 
 // Tests one seed given l = mix64(seed ^ SILVER) and h = mix64((seed ^ SILVER) + GOLDEN).
@@ -383,7 +390,14 @@ __device__ __forceinline__ void filter_one(uint64_t seed, uint64_t l, uint64_t h
   constexpr float maxScore = 0.038f; // 0.045f, 0.035f, 0.03f, 0.025f  ==  1 in 2700, 9400, 26000, 54000
 
   const auto seed_fork = XrsrRandom_seed_fork_from_mix(l, h);
+#if FS_FAST
+  // raw state, skipping XrsrRandom's all-zero-state fix-up (a 2^-128 event)
+  XrsrRandom noise_random;
+  noise_random.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
+  noise_random.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
+#else
   auto noise_random = seed_fork.from(device_chosen_continentalness_config.fork_hash);
+#endif
 
   const auto noise_a_yo_fork = noise_yo_fork(noise_random.fork());
   
