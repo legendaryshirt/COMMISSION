@@ -842,6 +842,9 @@ constexpr uint32_t block_dim_x = 256;
 // 512: table duplicated (index v + nz <= 510 needs no mask); 256: single copy, index masked.
 constexpr uint32_t conv_rows = GV1_ROWS;
 static_assert(conv_rows == 256 || conv_rows == 512);
+#ifndef GV1_MASK
+#define GV1_MASK 1
+#endif
 #ifndef GV1_MINB
 #define GV1_MINB 1 // min resident blocks per SM hint (caps registers)
 #endif
@@ -975,10 +978,25 @@ __launch_bounds__(block_dim_x, GV1_MINB) void kernel(
         g1[j] = pk1[w1[j + 2]];
       }
 
+#if GV1_MASK
+      // Gates for all 8 candidates as a predicate mask (no per-candidate branch regions), then one
+      // warp-uniform check; the full score runs only for set bits (0.17% of lane-candidates).
+      uint32_t pass_mask = 0;
+#pragma unroll
+      for (int candidate = 0; candidate < 8; ++candidate) {
+        const float gate = g0[candidate].x + g0[candidate + 1].y + g1[candidate].x + g1[candidate + 1].y;
+        pass_mask |= (gate >= kGradVecs1PrefilterThreshold ? 1u : 0u) << candidate;
+      }
+      if (__any_sync(0xFFFFFFFFu, pass_mask != 0)) {
+#pragma unroll
+      for (int candidate = 0; candidate < 8; ++candidate) {
+        if (pass_mask & (1u << candidate)) {
+#else
 #pragma unroll
       for (int candidate = 0; candidate < 8; ++candidate) {
         const float gate = g0[candidate].x + g0[candidate + 1].y + g1[candidate].x + g1[candidate + 1].y;
         if (gate >= kGradVecs1PrefilterThreshold) {
+#endif
           float score = 0.0f;
           score += conv0[0][w0[candidate]];
           score += conv1[0][w1[candidate]];
@@ -1001,6 +1019,9 @@ __launch_bounds__(block_dim_x, GV1_MINB) void kernel(
         }
       }
 
+#if GV1_MASK
+      }
+#endif
       x += 8 * cell_size;
 
       c0_0 = c0_2;

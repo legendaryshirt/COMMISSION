@@ -23,6 +23,8 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | filter_seeds: U32 float convert + skip zero-state fix-up (FS_FAST), golden | 1873 (ref 1932) | — | — | 5738 (ref 5799) | **23.95** | **kept: seeds −3.0%, total −1.0%, counts identical** |
 | **filter_seeds: per-warp shared queue compaction of first-test survivors (FS_COMPACT), chain 16** | 1754 (ref 1878) | — | — | 5622 (ref 5755) | 24.45 | **kept: seeds −6.6%, counts identical** |
 | FS_COMPACT, chain 32 / 64 / 128 / 256 | 1715 / 1695 / 1690 / 1698 | — | — | 5586 / 5559 / 5555 / 5562 | 24.60 / **24.72** / 24.74 / 24.71 | **chain 64 is the default** (plateau) |
+| gv1: gate pass bits as a predicate mask + one warp `any` (GV1_MASK) | — | 2246 (ref 2258) | — | 5550 (ref 5559) | 24.77 | kept: −0.5% gv1, exact |
+| gv1: uint32 pre-scaled gate offsets via broadcast LDS.128 (GV1_IDX32) | — | 2926 (ref 2246) | — | 6219 | 22.10 | **rejected, +30% gv1** |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
