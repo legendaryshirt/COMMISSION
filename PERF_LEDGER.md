@@ -34,6 +34,7 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | filter_seeds: queue first-test state (seed, RNG after fork, a-yo fork, score) so the dense pass resumes instead of recomputing ~85 ALU ops/survivor | **1584** (ref 1699) | 1880 | — | **5075** | **27.08** | **kept: −6.8% seeds, counts identical** |
 | filter_seeds: second-level queue after test 2 (test-2 survival 10.9%, but tests 3..6 ran for 97.5% of warps) | 1629 / 1608 / 1604 (TPB 256/128/64; ref 1584) | — | — | 5124-5097 | ≤26.96 | **rejected**: queue bookkeeping + flush > divergence saved; counts identical |
 | f2_01a/b: hoist gradDot's y/z part (fmaf(y,gy,z*gz)) into the cell branch, exact (F2_PRE) | — | — | 1029 (PRE+minB3) vs 1042 (minB3 only) | 5080 | 27.05 | **rejected: −1.2% of 2_01a (~0.25% total) for ~40 lines**. NB `__launch_bounds__(256,1)` alone made 2_01a +6% (more regs) |
+| **2 pipelines per GPU (`--pipelines`, own stream + buffers, shared seed iterator)**: fills the latency-bound tail stages and kernel-boundary drains | 90 s wall: 2.413 T (1) -> **2.491 T (2)**, 2.498 T (3) seeds | | | | **≈27.9** | **kept, +3.2% end to end** (default 2; 3 adds only +0.3% for another ~2.9 GB) |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
@@ -112,7 +113,7 @@ Ada's ALU pipe (LOP3/SHF/IADD3) does 64 lanes/clk/SM. The SASS has about 150 ALU
 (84 LOP3, 44 SHF.L.W rotates, ...), which is about 64/clk/SM at the measured 73 G seeds/s. It sits
 on that roofline, so only removing ops helps.
 
-## Cumulative (2026-11-06, golden default): 20.88 -> 27.08 G seeds/s (+29.7%) at identical funnel output.
+## Cumulative (2026-11-06, golden default): 20.88 -> ~27.9 G seeds/s (+33.7%, 2 pipelines) at identical funnel output.
 
 ## Why FS_COMPACT works
 With 21.7% passing the first test, P(some lane of 32 passes) = 99.96%, so under per-lane branching

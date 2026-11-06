@@ -27,6 +27,10 @@ constexpr bool unbound = false;
 #define SEED_ORDER_GOLDEN 1
 #endif
 
+#ifndef DEFAULT_PIPELINES
+#define DEFAULT_PIPELINES 2
+#endif
+
 #ifndef MAX_ITERS
 #define MAX_ITERS 0
 #endif

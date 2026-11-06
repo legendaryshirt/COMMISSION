@@ -20,9 +20,14 @@ close_session() {   # record the range covered by a finished or killed previous 
   key=$(cat search/current.key); first=$(awk '/^Starting from/{print $3; exit}' "$LOG")
   local st; st=$(awk '/^Start seed: /{gsub(",","",$3); print $3, $7}' "$LOG" | tail -1)
   end=""; [ -n "$st" ] && end=$(( ${st% *} + ${st#* } ))   # bash int64: awk doubles lose bits near 2^62
-  if [ -z "$end" ]; then   # killed hard: last completed batch printed in the stats table
+  if [ -z "$end" ]; then   # killed hard: fall back to the progress lines, conservatively
+    # Each pipeline prints every 64 of its own batches and finishes its batches in order, so
+    # every batch more than (64+1)*P batches before the newest printed one is complete. This
+    # may re-check a few seconds of seeds but never leaves a gap.
+    local p=${PIPELINES:-2}
     end=$(awk '/^start_seed = /{s=$3} END{if (s!="") print s}' "$LOG")
-    [ -n "$end" ] && end=$((end + BATCH))
+    [ -n "$end" ] && end=$((end - (64 + 1) * p * BATCH))
+    [ -n "$end" ] && [ "$end" -lt "$first" ] && end=""
   fi
   found=$(grep -c . search/current.found 2>/dev/null || true); found=${found:-0}
   [ -n "$first" ] && [ -n "$end" ] && printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$key" "$first" "$end" "$found" >> "$LEDGER"
@@ -44,4 +49,4 @@ bin=main-$([ "$UNBOUND" = 1 ] && echo u)$([ "$LARGE_BIOMES" = 1 ] && echo lb || 
   cp "$bin" search/search-bin
 } 9>/tmp/commission-build.lock
 echo "search $KEY from logical $next"
-exec ./search/search-bin --start "$next" --threads 4 --output search/current.found "$@" > "$LOG" 2>&1
+exec ./search/search-bin --start "$next" --pipelines "${PIPELINES:-2}" --threads 4 --output search/current.found "$@" > "$LOG" 2>&1
