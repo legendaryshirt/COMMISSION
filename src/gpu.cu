@@ -398,27 +398,10 @@ __device__ __forceinline__ bool first_test(uint64_t l, uint64_t h) {
   return 0.35f * fabsf(c_0A_yo - 0.5f) < maxScore;
 }
 
-__device__ __forceinline__ void filter_one(uint64_t seed, uint64_t l, uint64_t h, OutputBuffer<uint64_t> &outputs) {
-  constexpr float maxScore = 0.038f; // 0.045f, 0.035f, 0.03f, 0.025f  ==  1 in 2700, 9400, 26000, 54000
-
-  const auto seed_fork = XrsrRandom_seed_fork_from_mix(l, h);
-#if FS_FAST
-  // raw state, skipping XrsrRandom's all-zero-state fix-up (a 2^-128 event)
-  XrsrRandom noise_random;
-  noise_random.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
-  noise_random.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
-#else
-  auto noise_random = seed_fork.from(device_chosen_continentalness_config.fork_hash);
-#endif
-
-  const auto noise_a_yo_fork = noise_yo_fork(noise_random.fork());
-  
-  float c_0A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(noise_a_yo_fork);
-  float score = 0.35f * fabsf(c_0A_yo - 0.5f);
-  if (score >= maxScore) {
-    return;
-  }
-
+// Everything after the first test. noise_random is the state after the first fork(),
+// noise_a_yo_fork and score are what the first test produced.
+__device__ __forceinline__ void filter_rest(uint64_t seed, XrsrRandom noise_random, const XrsrRandomFork noise_a_yo_fork, float score, OutputBuffer<uint64_t> &outputs) {
+  constexpr float maxScore = 0.038f;
   const auto noise_b_yo_fork = noise_yo_fork(noise_random.fork());
   float c_0B_yo = octave_yo_mod1<chosen_continentalness_config.octaves_b[0]>(noise_b_yo_fork);
   score += 0.35f * fabsf(c_0B_yo - 0.5f);
@@ -457,6 +440,30 @@ __device__ __forceinline__ void filter_one(uint64_t seed, uint64_t l, uint64_t h
   outputs.data[result_index] = seed;
 }
 
+__device__ __forceinline__ void filter_one(uint64_t seed, uint64_t l, uint64_t h, OutputBuffer<uint64_t> &outputs) {
+  constexpr float maxScore = 0.038f; // 0.045f, 0.035f, 0.03f, 0.025f  ==  1 in 2700, 9400, 26000, 54000
+
+  const auto seed_fork = XrsrRandom_seed_fork_from_mix(l, h);
+#if FS_FAST
+  // raw state, skipping XrsrRandom's all-zero-state fix-up (a 2^-128 event)
+  XrsrRandom noise_random;
+  noise_random.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
+  noise_random.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
+#else
+  auto noise_random = seed_fork.from(device_chosen_continentalness_config.fork_hash);
+#endif
+
+  const auto noise_a_yo_fork = noise_yo_fork(noise_random.fork());
+  
+  float c_0A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(noise_a_yo_fork);
+  float score = 0.35f * fabsf(c_0A_yo - 0.5f);
+  if (score >= maxScore) {
+    return;
+  }
+
+  filter_rest(seed, noise_random, noise_a_yo_fork, score, outputs);
+}
+
 
 #if SEED_ORDER_GOLDEN
 // Logical index n maps to seed (n * GOLDEN) ^ SILVER (a bijection: GOLDEN is odd). Then
@@ -486,33 +493,49 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
   // In a warp at least one lane almost always passes the first test, so with per-lane branching
   // every lane pays for the later stages. Instead, passing seeds go into a per-warp shared queue
   // and are re-tested densely, 32 at a time (filter_one repeats the cheap first test).
-  __shared__ uint64_t queue[threads_per_block / 32][64];
-  const uint32_t lane = threadIdx.x & 31u;
-  uint64_t *q = queue[threadIdx.x >> 5];
+  // Survivors are queued with the state the first test reached (seed, RNG state after the
+  // first fork, a-yo fork state, partial score), so the dense pass resumes instead of recomputing.
+  constexpr uint32_t W = threads_per_block / 32;
+  __shared__ uint64_t q_seed[W][64], q_lo[W][64], q_hi[W][64], q_alo[W][64], q_ahi[W][64];
+  __shared__ float q_score[W][64];
+  const uint32_t lane = threadIdx.x & 31u, w = threadIdx.x >> 5;
   uint32_t qn = 0;
   uint64_t l = XrsrRandom::mix64(x);
+  auto dense = [&](uint32_t i) {
+    XrsrRandom nr;
+    nr.lo = q_lo[w][i];
+    nr.hi = q_hi[w][i];
+    filter_rest(q_seed[w][i], nr, XrsrRandomFork{q_alo[w][i], q_ahi[w][i]}, q_score[w][i], outputs);
+  };
   for (uint32_t k = 0; k < chain; k++) {
-    const uint64_t seed_x = x;
+    const uint64_t seed = x ^ XrsrRandom::XRSR_SILVER_RATIO;
     x += XrsrRandom::XRSR_GOLDEN_RATIO;
     const uint64_t h = XrsrRandom::mix64(x);
-    const bool pass = first_test(l, h);
+    const auto seed_fork = XrsrRandom_seed_fork_from_mix(l, h);
     l = h;
+    XrsrRandom nr;
+    nr.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
+    nr.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
+    const auto a_yo = noise_yo_fork(nr.fork());
+    const float c_0A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(a_yo);
+    const float score = 0.35f * fabsf(c_0A_yo - 0.5f);
+    const bool pass = score < 0.038f;
     const uint32_t b = __ballot_sync(0xFFFFFFFFu, pass);
-    if (pass) q[qn + __popc(b & ((1u << lane) - 1u))] = seed_x;
+    if (pass) {
+      const uint32_t i = qn + __popc(b & ((1u << lane) - 1u));
+      q_seed[w][i] = seed; q_lo[w][i] = nr.lo; q_hi[w][i] = nr.hi;
+      q_alo[w][i] = a_yo.lo; q_ahi[w][i] = a_yo.hi; q_score[w][i] = score;
+    }
     qn += __popc(b);
     if (qn >= 32) {
       __syncwarp();
-      const uint64_t sx = q[qn - 32 + lane];
-      filter_one(sx ^ XrsrRandom::XRSR_SILVER_RATIO, XrsrRandom::mix64(sx), XrsrRandom::mix64(sx + XrsrRandom::XRSR_GOLDEN_RATIO), outputs);
+      dense(qn - 32 + lane);
       qn -= 32;
       __syncwarp();
     }
   }
   __syncwarp();
-  if (lane < qn) {
-    const uint64_t sx = q[lane];
-    filter_one(sx ^ XrsrRandom::XRSR_SILVER_RATIO, XrsrRandom::mix64(sx), XrsrRandom::mix64(sx + XrsrRandom::XRSR_GOLDEN_RATIO), outputs);
-  }
+  if (lane < qn) dense(lane);
 #else
   uint64_t l = XrsrRandom::mix64(x);
   for (uint32_t k = 0; k < chain; k++) {

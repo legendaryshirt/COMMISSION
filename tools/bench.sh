@@ -5,6 +5,10 @@
 set -euo pipefail
 ITERS=${1:-64}; START=${2:-1000000000000}; shift $(( $# < 2 ? $# : 2 ))
 cd "$(dirname "$0")/.."
-make -B -s NO_NET=1 MAX_ITERS="$ITERS" PRINT_INTERVAL="$ITERS" "$@" >/dev/null
-bin=$(ls -t main-* | head -1)
-"./$bin" --start "$START" --output /tmp/commission-bench-out.txt | grep -v -E '^(Initializing|Running)'
+tmp=$(mktemp -d)
+{
+  flock 9   # shared with tools/search.sh: never swap a binary out from under the search
+  make -B -s NO_NET=1 MAX_ITERS="$ITERS" PRINT_INTERVAL="$ITERS" "$@" >/dev/null
+  cp "$(ls -t main-* | head -1)" "$tmp/bench-bin"
+} 9>/tmp/commission-build.lock
+"$tmp/bench-bin" --start "$START" --output /tmp/commission-bench-out.txt | grep -v -E '^(Initializing|Running)'

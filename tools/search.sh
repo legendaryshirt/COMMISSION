@@ -35,7 +35,13 @@ close_session
 next=$(awk -F'\t' -v k="$KEY" '$2==k && $4>m {m=$4} END{if (m!="") print m}' "$LEDGER" 2>/dev/null || true)
 next=${next:-$DEFAULT_START}
 echo "$KEY" > search/current.key
-make -s NO_NET=1 SEED_ORDER="$SEED_ORDER" LARGE_BIOMES="$LARGE_BIOMES" UNBOUND="$UNBOUND" PRINT_INTERVAL=64 MAX_ITERS=0 -B >/dev/null
 bin=main-$([ "$UNBOUND" = 1 ] && echo u)$([ "$LARGE_BIOMES" = 1 ] && echo lb || echo sb)
+# Build under the lock that tools/bench.sh also takes, and run a private copy, so a benchmark
+# build in the same tree can never replace the binary the search runs.
+{
+  flock 9
+  make -s NO_NET=1 SEED_ORDER="$SEED_ORDER" LARGE_BIOMES="$LARGE_BIOMES" UNBOUND="$UNBOUND" PRINT_INTERVAL=64 MAX_ITERS=0 -B >/dev/null
+  cp "$bin" search/search-bin
+} 9>/tmp/commission-build.lock
 echo "search $KEY from logical $next"
-exec "./$bin" --start "$next" --threads 4 --output search/current.found "$@" > "$LOG" 2>&1
+exec ./search/search-bin --start "$next" --threads 4 --output search/current.found "$@" > "$LOG" 2>&1
