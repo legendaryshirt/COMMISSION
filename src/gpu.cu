@@ -792,6 +792,9 @@ constexpr uint32_t block_dim_x = 256;
 // 512: table duplicated (index v + nz <= 510 needs no mask); 256: single copy, index masked.
 constexpr uint32_t conv_rows = GV1_ROWS;
 static_assert(conv_rows == 256 || conv_rows == 512);
+#ifndef GV1_MINB
+#define GV1_MINB 1 // min resident blocks per SM hint (caps registers)
+#endif
 
 __device__ __forceinline__ uint32_t conv_index(uint32_t v, uint32_t nz) {
   if constexpr (conv_rows == 512) return v + nz;
@@ -806,7 +809,7 @@ __device__ __forceinline__ uint32_t conv_index(uint32_t v, uint32_t nz) {
 // j-2 and column 3 of candidate j-3 -> 9 loads per row per 8 candidates instead of 16.
 // Summation order matches the original score_center_2x2 / score_full_12 exactly.
 __global__
-__launch_bounds__(block_dim_x) void kernel(
+__launch_bounds__(block_dim_x, GV1_MINB) void kernel(
     const InputBuffer<uint64_t> seeds,
     OutputBuffer<SeedPos> outputs,
     const KernelSeed1::Result* __restrict__ results)

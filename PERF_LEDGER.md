@@ -14,6 +14,8 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | `SEED_ORDER=golden` straight reference (2 mix64/seed, same seeds) | 2094 | 2324 | 1431 | 6449 | 21.31 | reference for the next row |
 | `SEED_ORDER=golden`, chain 8 (1 mix64/seed) | 1942 | 2322 | 1430 | 6293 | 21.84 | counts identical to reference |
 | `SEED_ORDER=golden`, chain 16 | 1925 | — | — | 6274 | 21.91 | **kept, now the DEFAULT (2026-11-05): −8.1% seeds, +2.6% total** (4: 6324, 32: 6270) |
+| gv1 256-row masked + `__launch_bounds__(256,4)` (≤64 regs, 4 blocks/SM) | — | 2672 | — | 6805 | 20.20 | rejected (+18% gv1 vs 2261 same-session ref) |
+| gv1 256-row masked + minBlocks 5 / 6 | — | 5690 / 16768 | — | 9820 / 20886 | 13.99 / 6.58 | rejected: register spills. gv1 isn't latency-bound, so occupancy doesn't help |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
@@ -66,3 +68,7 @@ graceful SIGINT path). Without dedup: 48 lines / 37 unique islands. With dedup r
 Earlier note, kept for history: a fixed-work check was owed. Time-limited runs verify a different subset (the single CPU
 thread is the bottleneck), so the unique counts above aren't comparable. Run identical seeds with
 the CPU queue fully drained, with and without dedup, and confirm the unique island sets match.
+
+Note (2026-11-06): the unchanged gv1 512-row config measured 2261 ms in this session, against 2317
+on 2026-11-05: a 2.4% clock/thermal drift between sessions. Only compare against a same-session
+reference row.
