@@ -21,6 +21,8 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | gv1 warp-uniform gate skip: per-64-row-window max of each gate term (exact, counts identical) | — | 5630 (ref 2257) | — | 9414 | 14.60 | **rejected, 2.5x slower**: the bound passes 99.999% of candidates |
 | **f2_01a/b: byte-pair permutation table, 7 shared loads per cell instead of 14** | — | — | **1021** (ref 1115) | **5958** (ref 6053) | **23.07** | **kept: 2_01a −8.4%, 2_01b −8%, total −1.6%, counts byte-identical** |
 | filter_seeds: U32 float convert + skip zero-state fix-up (FS_FAST), golden | 1873 (ref 1932) | — | — | 5738 (ref 5799) | **23.95** | **kept: seeds −3.0%, total −1.0%, counts identical** |
+| **filter_seeds: per-warp shared queue compaction of first-test survivors (FS_COMPACT), chain 16** | 1754 (ref 1878) | — | — | 5622 (ref 5755) | 24.45 | **kept: seeds −6.6%, counts identical** |
+| FS_COMPACT, chain 32 / 64 / 128 / 256 | 1715 / 1695 / 1690 / 1698 | — | — | 5586 / 5559 / 5555 / 5562 | 24.60 / **24.72** / 24.74 / 24.71 | **chain 64 is the default** (plateau) |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
@@ -99,4 +101,10 @@ Ada's ALU pipe (LOP3/SHF/IADD3) does 64 lanes/clk/SM. The SASS has about 150 ALU
 (84 LOP3, 44 SHF.L.W rotates, ...), which is about 64/clk/SM at the measured 73 G seeds/s. It sits
 on that roofline, so only removing ops helps.
 
-## Cumulative (2026-11-06, golden default): 20.88 -> 23.95 G seeds/s (+14.7%) at identical funnel output.
+## Cumulative (2026-11-06, golden default): 20.88 -> 24.72 G seeds/s (+18.4%) at identical funnel output.
+
+## Why FS_COMPACT works
+With 21.7% passing the first test, P(some lane of 32 passes) = 99.96%, so under per-lane branching
+every lane paid for the second-stage forks. Survivors are now queued per warp in shared memory and
+re-run 32 at a time; the dense pass repeats the cheap first test and recomputes the 2 mix64s. A
+longer chain amortizes the flush of the partial queue at the end.

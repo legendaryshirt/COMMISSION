@@ -386,6 +386,18 @@ __device__ float octave_yo_mod1(const XrsrRandomFork &noise_yo_fork) {
 }
 
 // Tests one seed given l = mix64(seed ^ SILVER) and h = mix64((seed ^ SILVER) + GOLDEN).
+// First test of filter_one only (21.7% pass): used by the compacting kernel.
+__device__ __forceinline__ bool first_test(uint64_t l, uint64_t h) {
+  constexpr float maxScore = 0.038f;
+  const auto seed_fork = XrsrRandom_seed_fork_from_mix(l, h);
+  XrsrRandom noise_random;
+  noise_random.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
+  noise_random.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
+  const auto noise_a_yo_fork = noise_yo_fork(noise_random.fork());
+  const float c_0A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(noise_a_yo_fork);
+  return 0.35f * fabsf(c_0A_yo - 0.5f) < maxScore;
+}
+
 __device__ __forceinline__ void filter_one(uint64_t seed, uint64_t l, uint64_t h, OutputBuffer<uint64_t> &outputs) {
   constexpr float maxScore = 0.038f; // 0.045f, 0.035f, 0.03f, 0.025f  ==  1 in 2700, 9400, 26000, 54000
 
@@ -452,7 +464,10 @@ __device__ __forceinline__ void filter_one(uint64_t seed, uint64_t l, uint64_t h
 // mix64 per seed instead of two. SEED_CHAIN_STRAIGHT=1 computes the same seeds with two
 // mixes each, as a reference for checking the chained version.
 #ifndef SEED_CHAIN
-#define SEED_CHAIN 16
+#define SEED_CHAIN 64
+#endif
+#ifndef FS_COMPACT
+#define FS_COMPACT 1
 #endif
 #ifndef SEED_CHAIN_STRAIGHT
 #define SEED_CHAIN_STRAIGHT 0
@@ -466,6 +481,37 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
 #if SEED_CHAIN_STRAIGHT
   for (uint32_t k = 0; k < chain; k++, x += XrsrRandom::XRSR_GOLDEN_RATIO) {
     filter_one(x ^ XrsrRandom::XRSR_SILVER_RATIO, XrsrRandom::mix64(x), XrsrRandom::mix64(x + XrsrRandom::XRSR_GOLDEN_RATIO), outputs);
+  }
+#elif FS_COMPACT
+  // In a warp at least one lane almost always passes the first test, so with per-lane branching
+  // every lane pays for the later stages. Instead, passing seeds go into a per-warp shared queue
+  // and are re-tested densely, 32 at a time (filter_one repeats the cheap first test).
+  __shared__ uint64_t queue[threads_per_block / 32][64];
+  const uint32_t lane = threadIdx.x & 31u;
+  uint64_t *q = queue[threadIdx.x >> 5];
+  uint32_t qn = 0;
+  uint64_t l = XrsrRandom::mix64(x);
+  for (uint32_t k = 0; k < chain; k++) {
+    const uint64_t seed_x = x;
+    x += XrsrRandom::XRSR_GOLDEN_RATIO;
+    const uint64_t h = XrsrRandom::mix64(x);
+    const bool pass = first_test(l, h);
+    l = h;
+    const uint32_t b = __ballot_sync(0xFFFFFFFFu, pass);
+    if (pass) q[qn + __popc(b & ((1u << lane) - 1u))] = seed_x;
+    qn += __popc(b);
+    if (qn >= 32) {
+      __syncwarp();
+      const uint64_t sx = q[qn - 32 + lane];
+      filter_one(sx ^ XrsrRandom::XRSR_SILVER_RATIO, XrsrRandom::mix64(sx), XrsrRandom::mix64(sx + XrsrRandom::XRSR_GOLDEN_RATIO), outputs);
+      qn -= 32;
+      __syncwarp();
+    }
+  }
+  __syncwarp();
+  if (lane < qn) {
+    const uint64_t sx = q[lane];
+    filter_one(sx ^ XrsrRandom::XRSR_SILVER_RATIO, XrsrRandom::mix64(sx), XrsrRandom::mix64(sx + XrsrRandom::XRSR_GOLDEN_RATIO), outputs);
   }
 #else
   uint64_t l = XrsrRandom::mix64(x);
