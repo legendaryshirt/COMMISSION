@@ -122,10 +122,6 @@ __device__ constexpr auto continentalness_large_config = make_normal_noise_confi
 __device__ constexpr auto chosen_continentalness_config = large_biomes ? continentalness_large_config : continentalness_config;
 __device__ constexpr auto device_chosen_continentalness_config = chosen_continentalness_config;
 
-#ifndef GRAD_PACKED
-#define GRAD_PACKED 1
-#endif
-#if GRAD_PACKED
 // One 32-bit word per hash. Byte k holds the top byte of the float 2*g_k (g_k in {-1,0,1}):
 // +2.0 = 0x40000000, -2.0 = 0xC0000000, 0 = 0, so one __byte_perm rebuilds each component.
 // The noise kernels are LSU-bound (Ada issues ~0.5 LSU warp-instr/clk/SM); this turns 3 shared
@@ -135,14 +131,6 @@ struct GradDotTable {
   uint32_t g[16];
 };
 constexpr float grad_scale_comp = 0.5f;
-#else
-struct GradDotTable {
-  float x[16];
-  float y[16];
-  float z[16];
-};
-constexpr float grad_scale_comp = 1.0f;
-#endif
 
 __device__ GradDotTable device_grad_dot_table;
 
@@ -153,14 +141,8 @@ void init_grad_dot_table() {
   };
   GradDotTable table;
   for (int h = 0; h < 16; h++) {
-#if GRAD_PACKED
     auto enc = [](int v) -> uint32_t { return v > 0 ? 0x40u : (v < 0 ? 0xC0u : 0u); };
     table.g[h] = enc(g[h][0]) | (enc(g[h][1]) << 8) | (enc(g[h][2]) << 16);
-#else
-    table.x[h] = g[h][0];
-    table.y[h] = g[h][1];
-    table.z[h] = g[h][2];
-#endif
   }
 
   void *device_grad_dot_table_addr;
@@ -170,15 +152,11 @@ void init_grad_dot_table() {
 
 __forceinline__ __device__ float gradDot(const GradDotTable &table, uint8_t p, float x, float y, float z) {
   const uint32_t hash = p & 0xF;
-#if GRAD_PACKED
   const uint32_t w = table.g[hash];
   const float gx = __uint_as_float(__byte_perm(w, 0, 0x0444));
   const float gy = __uint_as_float(__byte_perm(w, 0, 0x1444));
   const float gz = __uint_as_float(__byte_perm(w, 0, 0x2444));
   return fmaf(x, gx, fmaf(y, gy, z * gz));
-#else
-  return fmaf(x, table.x[hash], fmaf(y, table.y[hash], z * table.z[hash]));
-#endif
 }
 
 __forceinline__ __device__ float smoothstep(float value) {
@@ -344,9 +322,6 @@ __device__ inline void XrsrRandom_double_fork(XrsrRandom &rng, XrsrRandomFork &f
   fork_b = { r3, r4 };
 }
 
-#ifndef FS_FAST
-#define FS_FAST 1
-#endif
 namespace KernelFilterSeeds {
 constexpr uint32_t threads_per_block = 256;
 constexpr uint32_t threads_per_run = UINT64_C(1) << 28; //28
@@ -378,28 +353,10 @@ __device__ float octave_yo_mod1(const XrsrRandomFork &noise_yo_fork) {
   uint64_t h = noise_yo_fork.hi ^ fork_hash.hi;
   uint64_t r = XrsrRandom::rol64(l + h, 17) + l;
   
-#if FS_FAST
   return (float)(uint32_t)((r >> 32) & 0xFFFFFF) * 5.9604645E-8f; // 24-bit value: U32 convert is exact
-#else
-  return ((r >> 32) & 0xFFFFFF) * 5.9604645E-8f;
-#endif
 }
 
 // Tests one seed given l = mix64(seed ^ SILVER) and h = mix64((seed ^ SILVER) + GOLDEN).
-// First test of filter_one only (21.7% pass): used by the compacting kernel.
-__device__ __forceinline__ bool first_test(uint64_t l, uint64_t h) {
-  constexpr float maxScore = 0.038f;
-  const auto seed_fork = XrsrRandom_seed_fork_from_mix(l, h);
-  XrsrRandom noise_random;
-  noise_random.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
-  noise_random.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
-  const auto noise_a_yo_fork = noise_yo_fork(noise_random.fork());
-  const float c_0A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(noise_a_yo_fork);
-  return 0.35f * fabsf(c_0A_yo - 0.5f) < maxScore;
-}
-
-// Everything after the first test. noise_random is the state after the first fork(),
-// noise_a_yo_fork and score are what the first test produced.
 __device__ __forceinline__ void filter_rest(uint64_t seed, XrsrRandom noise_random, const XrsrRandomFork noise_a_yo_fork, float score, OutputBuffer<uint64_t> &outputs) {
   constexpr float maxScore = 0.038f;
   const auto noise_b_yo_fork = noise_yo_fork(noise_random.fork());
@@ -440,79 +397,49 @@ __device__ __forceinline__ void filter_rest(uint64_t seed, XrsrRandom noise_rand
   outputs.data[result_index] = seed;
 }
 
-__device__ __forceinline__ void filter_one(uint64_t seed, uint64_t l, uint64_t h, OutputBuffer<uint64_t> &outputs) {
-  constexpr float maxScore = 0.038f; // 0.045f, 0.035f, 0.03f, 0.025f  ==  1 in 2700, 9400, 26000, 54000
 
-  const auto seed_fork = XrsrRandom_seed_fork_from_mix(l, h);
-#if FS_FAST
-  // raw state, skipping XrsrRandom's all-zero-state fix-up (a 2^-128 event)
-  XrsrRandom noise_random;
-  noise_random.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
-  noise_random.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
-#else
-  auto noise_random = seed_fork.from(device_chosen_continentalness_config.fork_hash);
-#endif
-
-  const auto noise_a_yo_fork = noise_yo_fork(noise_random.fork());
-  
-  float c_0A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(noise_a_yo_fork);
-  float score = 0.35f * fabsf(c_0A_yo - 0.5f);
-  if (score >= maxScore) {
-    return;
-  }
-
-  filter_rest(seed, noise_random, noise_a_yo_fork, score, outputs);
-}
-
-
-#if SEED_ORDER_GOLDEN
-// Logical index n maps to seed (n * GOLDEN) ^ SILVER (a bijection: GOLDEN is odd). Then
-// seed n's second mix64 is seed n+1's first, so a thread walking consecutive n pays one
-// mix64 per seed instead of two. SEED_CHAIN_STRAIGHT=1 computes the same seeds with two
-// mixes each, as a reference for checking the chained version.
-#ifndef SEED_CHAIN
-#define SEED_CHAIN 64
-#endif
-#ifndef FS_COMPACT
-#define FS_COMPACT 1
-#endif
-#ifndef SEED_CHAIN_STRAIGHT
-#define SEED_CHAIN_STRAIGHT 0
-#endif
-constexpr uint32_t chain = SEED_CHAIN;
+// Each thread tests `chain` consecutive seed indices n. In linear order seed = n (upstream's
+// order); with SEED_ORDER_GOLDEN, seed = (n * GOLDEN) ^ SILVER, a bijection on all 2^64 seeds
+// in which seed n's second mix64 is seed n+1's first, so a chain pays one mix64 per seed.
+//
+// Test 1 passes 21.7% of seeds, so nearly every warp has a passing lane and per-lane branching
+// would make every lane pay for tests 2..6. Instead, test-1 survivors are queued per warp in
+// shared memory together with the state test 1 reached (RNG after the first fork, a-yo fork,
+// partial score), and the queue is drained 32 at a time through filter_rest.
+constexpr uint32_t chain = 64;
 static_assert(threads_per_run % (threads_per_block * chain) == 0);
+constexpr uint32_t threads_launched = threads_per_run / chain;
 
 __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed, OutputBuffer<uint64_t> outputs) {
-  const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  uint64_t x = (start_seed + (uint64_t)index * chain) * XrsrRandom::XRSR_GOLDEN_RATIO;
-#if SEED_CHAIN_STRAIGHT
-  for (uint32_t k = 0; k < chain; k++, x += XrsrRandom::XRSR_GOLDEN_RATIO) {
-    filter_one(x ^ XrsrRandom::XRSR_SILVER_RATIO, XrsrRandom::mix64(x), XrsrRandom::mix64(x + XrsrRandom::XRSR_GOLDEN_RATIO), outputs);
-  }
-#elif FS_COMPACT
-  // In a warp at least one lane almost always passes the first test, so with per-lane branching
-  // every lane pays for the later stages. Instead, passing seeds go into a per-warp shared queue
-  // and are re-tested densely, 32 at a time (filter_one repeats the cheap first test).
-  // Survivors are queued with the state the first test reached (seed, RNG state after the
-  // first fork, a-yo fork state, partial score), so the dense pass resumes instead of recomputing.
   constexpr uint32_t W = threads_per_block / 32;
   __shared__ uint64_t q_seed[W][64], q_lo[W][64], q_hi[W][64], q_alo[W][64], q_ahi[W][64];
   __shared__ float q_score[W][64];
   const uint32_t lane = threadIdx.x & 31u, w = threadIdx.x >> 5;
+  const uint64_t n0 = start_seed + (uint64_t)(blockIdx.x * blockDim.x + threadIdx.x) * chain;
   uint32_t qn = 0;
-  uint64_t l = XrsrRandom::mix64(x);
-  auto dense = [&](uint32_t i) {
+  auto drain = [&](uint32_t i) {
     XrsrRandom nr;
     nr.lo = q_lo[w][i];
     nr.hi = q_hi[w][i];
     filter_rest(q_seed[w][i], nr, XrsrRandomFork{q_alo[w][i], q_ahi[w][i]}, q_score[w][i], outputs);
   };
+#if SEED_ORDER_GOLDEN
+  uint64_t x = n0 * XrsrRandom::XRSR_GOLDEN_RATIO;
+  uint64_t l = XrsrRandom::mix64(x);
+#endif
   for (uint32_t k = 0; k < chain; k++) {
+#if SEED_ORDER_GOLDEN
     const uint64_t seed = x ^ XrsrRandom::XRSR_SILVER_RATIO;
     x += XrsrRandom::XRSR_GOLDEN_RATIO;
     const uint64_t h = XrsrRandom::mix64(x);
     const auto seed_fork = XrsrRandom_seed_fork_from_mix(l, h);
     l = h;
+#else
+    const uint64_t seed = n0 + k;
+    const uint64_t xs = seed ^ XrsrRandom::XRSR_SILVER_RATIO;
+    const auto seed_fork = XrsrRandom_seed_fork_from_mix(XrsrRandom::mix64(xs), XrsrRandom::mix64(xs + XrsrRandom::XRSR_GOLDEN_RATIO));
+#endif
+    // Raw state: XrsrRandom's constructor would also replace an all-zero state (a 2^-128 event).
     XrsrRandom nr;
     nr.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
     nr.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
@@ -529,34 +456,14 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
     qn += __popc(b);
     if (qn >= 32) {
       __syncwarp();
-      dense(qn - 32 + lane);
+      drain(qn - 32 + lane);
       qn -= 32;
       __syncwarp();
     }
   }
   __syncwarp();
-  if (lane < qn) dense(lane);
-#else
-  uint64_t l = XrsrRandom::mix64(x);
-  for (uint32_t k = 0; k < chain; k++) {
-    const uint64_t seed = x ^ XrsrRandom::XRSR_SILVER_RATIO;
-    x += XrsrRandom::XRSR_GOLDEN_RATIO;
-    const uint64_t h = XrsrRandom::mix64(x);
-    filter_one(seed, l, h, outputs);
-    l = h;
-  }
-#endif
+  if (lane < qn) drain(lane);
 }
-constexpr uint32_t threads_launched = threads_per_run / chain;
-#else
-__global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed, OutputBuffer<uint64_t> outputs) {
-  uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  uint64_t seed = start_seed + index;
-  uint64_t x = seed ^ XrsrRandom::XRSR_SILVER_RATIO;
-  filter_one(seed, XrsrRandom::mix64(x), XrsrRandom::mix64(x + XrsrRandom::XRSR_GOLDEN_RATIO), outputs);
-}
-constexpr uint32_t threads_launched = threads_per_run;
-#endif
 
 void run(uint64_t start_seed, OutputBuffer<uint64_t> outputs, cudaStream_t stream) {
   kernel<<<threads_launched / threads_per_block, threads_per_block, 0, stream>>>(start_seed, outputs);
@@ -858,254 +765,37 @@ __device__ __forceinline__ float score_full_12(
 }
 
 namespace KernelFilterGradVecs1 {
-constexpr uint32_t block_dim_x = 256;
-#ifndef GV1_ROWS
-#define GV1_ROWS 512
-#endif
-// 512: table duplicated (index v + nz <= 510 needs no mask); 256: single copy, index masked.
-constexpr uint32_t conv_rows = GV1_ROWS;
-static_assert(conv_rows == 256 || conv_rows == 512);
-#ifndef GV1_MASK
-#define GV1_MASK 1
-#endif
-#ifndef GV1_MINB
-#define GV1_MINB 1 // min resident blocks per SM hint (caps registers)
-#endif
+constexpr uint32_t conv_rows = 512; // gate tables duplicated: row index v + nz <= 510 needs no mask
 
-__device__ __forceinline__ uint32_t conv_index(uint32_t v, uint32_t nz) {
-  if constexpr (conv_rows == 512) return v + nz;
-  else return (v + nz) & 0xFF;
-}
-
-// Conv tables are stored column-major. Within a warp the row index is v + nz with v
-// warp-uniform and nz = lane, so every load is unit-stride across lanes (bank-conflict
-// free). Row-major [513][6] put lanes 24 B apart: a 2-way bank conflict on every load.
-// Columns 2 and 3 (the gate columns) are packed as float2: candidate c needs column 2 at
-// w[c+2] and column 3 at w[c+3], so one 8-byte load at w[j] serves column 2 of candidate
-// j-2 and column 3 of candidate j-3 -> 9 loads per row per 8 candidates instead of 16.
-// Summation order matches the original score_center_2x2 / score_full_12 exactly.
-__global__
-__launch_bounds__(block_dim_x, GV1_MINB) void kernel(
-    const InputBuffer<uint64_t> seeds,
-    OutputBuffer<SeedPos> outputs,
-    const KernelSeed1::Result* __restrict__ results)
-{
-  __shared__ alignas(16) ImprovedNoise oct_0A;
-  __shared__ alignas(16) float shared_kernel_0A[6][6][16][2];
-
-  __shared__ float conv0[4][conv_rows]; // columns 0, 1, 4, 5 of y-row 0
-  __shared__ float conv1[4][conv_rows]; // columns 0, 1, 4, 5 of y-row 1
-  __shared__ float2 pk0[conv_rows];     // columns 2, 3 of y-row 0
-  __shared__ float2 pk1[conv_rows];     // columns 2, 3 of y-row 1
-
-  __shared__ alignas(16) uint8_t idx_xy[2][272];
-
-  const int32_t nz = threadIdx.x;
-
-  for (uint32_t i = nz; i < 288; i += block_dim_x) {
-    reinterpret_cast<uint4*>(shared_kernel_0A)[i] =
-        reinterpret_cast<const uint4*>(device_kernel_0A)[i];
-  }
-
-  const uint32_t seeds_len = *seeds.len;
-  for (uint32_t seed_index = blockIdx.x; seed_index < seeds_len; seed_index += gridDim.x) {
-    __syncthreads();
-
-    if (nz < 17) {
-      reinterpret_cast<uint4*>(&oct_0A)[nz] =
-          reinterpret_cast<const uint4*>(&results[seed_index].continentalness_0A)[nz];
-    }
-
-    __syncthreads();
-
-    {
-      uint32_t p_z[6];
-#pragma unroll
-      for (int32_t dnz = 0; dnz < 6; ++dnz) {
-        p_z[dnz] = oct_0A.p[(nz + dnz) & 0xFF] & 0xF;
-      }
-
-      float c0[6], c1[6];
-#pragma unroll
-      for (int32_t dnx = 0; dnx < 6; ++dnx) {
-        float conv0_acc = 0.0f;
-        float conv1_acc = 0.0f;
-
-#pragma unroll
-        for (int32_t dnz = 0; dnz < 6; ++dnz) {
-          const uint32_t p = p_z[dnz];
-          conv0_acc += shared_kernel_0A[dnx][dnz][p][0];
-          conv1_acc += shared_kernel_0A[dnx][dnz][p][1];
-        }
-        c0[dnx] = conv0_acc;
-        c1[dnx] = conv1_acc;
-      }
-
-#pragma unroll
-      for (uint32_t copy = 0; copy < conv_rows / 256; ++copy) {
-        const uint32_t r = nz + copy * 256;
-        conv0[0][r] = c0[0]; conv0[1][r] = c0[1]; conv0[2][r] = c0[4]; conv0[3][r] = c0[5];
-        conv1[0][r] = c1[0]; conv1[1][r] = c1[1]; conv1[2][r] = c1[4]; conv1[3][r] = c1[5];
-        pk0[r] = make_float2(c0[2], c0[3]);
-        pk1[r] = make_float2(c1[2], c1[3]);
-      }
-    }
-
-    const int32_t cell_size = 512 * large_biomes_pos_mul;
-    const int32_t x_center = (2.5f - oct_0A.xo) * cell_size;
-    const int32_t ny = oct_0A.yo;
-    const int32_t z_center = (2.5f - oct_0A.zo) * cell_size;
-
-    const uint8_t idx_x = oct_0A.p[nz];
-    const uint8_t v0 = oct_0A.p[(idx_x + ny) & 0xFF];
-    const uint8_t v1 = oct_0A.p[(idx_x + ny + 1) & 0xFF];
-    idx_xy[0][nz] = v0;
-    idx_xy[1][nz] = v1;
-
-    if (nz < 6) {
-      idx_xy[0][256 + nz] = v0;
-      idx_xy[1][256 + nz] = v1;
-    }
-
-    __syncthreads();
-
-    int32_t x = x_center;
-    const int32_t z = z_center + nz * cell_size;
-
-    uchar4 c0_0 = *reinterpret_cast<const uchar4*>(&idx_xy[0][0]);
-    uchar4 c0_1 = *reinterpret_cast<const uchar4*>(&idx_xy[0][4]);
-    uchar4 c1_0 = *reinterpret_cast<const uchar4*>(&idx_xy[1][0]);
-    uchar4 c1_1 = *reinterpret_cast<const uchar4*>(&idx_xy[1][4]);
-
-    for (int32_t nx = 0; nx < 256; nx += 8) {
-      uchar4 c0_2 = *reinterpret_cast<const uchar4*>(&idx_xy[0][nx + 8]);
-      uchar4 c0_3 = *reinterpret_cast<const uchar4*>(&idx_xy[0][nx + 12]);
-      uchar4 c1_2 = *reinterpret_cast<const uchar4*>(&idx_xy[1][nx + 8]);
-      uchar4 c1_3 = *reinterpret_cast<const uchar4*>(&idx_xy[1][nx + 12]);
-
-      const uint8_t r0[13] = {c0_0.x, c0_0.y, c0_0.z, c0_0.w, c0_1.x, c0_1.y, c0_1.z, c0_1.w,
-                              c0_2.x, c0_2.y, c0_2.z, c0_2.w, c0_3.x};
-      const uint8_t r1[13] = {c1_0.x, c1_0.y, c1_0.z, c1_0.w, c1_1.x, c1_1.y, c1_1.z, c1_1.w,
-                              c1_2.x, c1_2.y, c1_2.z, c1_2.w, c1_3.x};
-      uint32_t w0[13], w1[13];
-#pragma unroll
-      for (int j = 0; j < 13; ++j) {
-        w0[j] = conv_index(r0[j], nz);
-        w1[j] = conv_index(r1[j], nz);
-      }
-
-      float2 g0[9], g1[9];
-#pragma unroll
-      for (int j = 0; j < 9; ++j) {
-        g0[j] = pk0[w0[j + 2]];
-        g1[j] = pk1[w1[j + 2]];
-      }
-
-#if GV1_MASK
-      // Gates for all 8 candidates as a predicate mask (no per-candidate branch regions), then one
-      // warp-uniform check; the full score runs only for set bits (0.17% of lane-candidates).
-      uint32_t pass_mask = 0;
-#pragma unroll
-      for (int candidate = 0; candidate < 8; ++candidate) {
-        const float gate = g0[candidate].x + g0[candidate + 1].y + g1[candidate].x + g1[candidate + 1].y;
-        pass_mask |= (gate >= kGradVecs1PrefilterThreshold ? 1u : 0u) << candidate;
-      }
-      if (__any_sync(0xFFFFFFFFu, pass_mask != 0)) {
-#pragma unroll
-      for (int candidate = 0; candidate < 8; ++candidate) {
-        if (pass_mask & (1u << candidate)) {
-#else
-#pragma unroll
-      for (int candidate = 0; candidate < 8; ++candidate) {
-        const float gate = g0[candidate].x + g0[candidate + 1].y + g1[candidate].x + g1[candidate + 1].y;
-        if (gate >= kGradVecs1PrefilterThreshold) {
-#endif
-          float score = 0.0f;
-          score += conv0[0][w0[candidate]];
-          score += conv1[0][w1[candidate]];
-          score += conv0[1][w0[candidate + 1]];
-          score += conv1[1][w1[candidate + 1]];
-          score += g0[candidate].x;
-          score += g1[candidate].x;
-          score += g0[candidate + 1].y;
-          score += g1[candidate + 1].y;
-          score += conv0[2][w0[candidate + 4]];
-          score += conv1[2][w1[candidate + 4]];
-          score += conv0[3][w0[candidate + 5]];
-          score += conv1[3][w1[candidate + 5]];
-          if (score > kGradVecs1FinalThreshold) {
-            uint32_t res_idx = atomicAdd(outputs.len, 1);
-            if (res_idx < outputs.max_len) {
-              outputs.data[res_idx] = {seed_index, x + candidate * cell_size, z};
-            }
-          }
-        }
-      }
-
-#if GV1_MASK
-      }
-#endif
-      x += 8 * cell_size;
-
-      c0_0 = c0_2;
-      c0_1 = c0_3;
-      c1_0 = c1_2;
-      c1_1 = c1_3;
-    }
-  }
-}
-
-
-#ifndef GV1_ZPT
-#define GV1_ZPT 2
-#endif
-// ZPT z-rows per thread, spaced 256/ZPT apart. Each candidate index v + nz is unpacked once per
-// thread and reused for every row: row k's address is the same register + k*(256/ZPT) rows,
-// a compile-time immediate. Values, tables and summation order are those of `kernel`.
-#ifndef GV1_CARRY
-#define GV1_CARRY 1
-#endif
-#ifndef GV1_ZMINB
-#define GV1_ZMINB 5
-#endif
-#ifndef GV1_SLIM
-#define GV1_SLIM 1
-#endif
-#if GV1_SLIM
-#define GV1_CI(i) ((i) & 0xFF)
-#else
-#define GV1_CI(i) (i)
-#endif
+// Conv tables are column-major: within a warp the row index is v + nz with v warp-uniform and
+// nz = lane, so loads are unit-stride across lanes (row-major [513][6] put lanes 24 B apart, a
+// 2-way bank conflict). Gate columns 2 and 3 are packed as float2: candidate c needs column 2
+// at w[c+2] and column 3 at w[c+3], so one 8-byte load serves two candidates, and the last load
+// of a group of 8 is carried into the next group (one load per y-row per candidate).
+// Each thread handles ZPT z-rows spaced 256/ZPT apart: the index v + nz is unpacked once and the
+// other rows are the same register plus a compile-time immediate. The full-score columns are
+// read only after the gate (0.17% of candidates), so they keep a single 256-row copy with a
+// masked index, and the conv-kernel table is read from global memory (L1) during the per-seed
+// build. That brings shared memory to ~17 KB per block (5 blocks/SM). Summation order is that
+// of upstream's score_center_2x2 / score_full_12.
 template <uint32_t ZPT>
-__global__ __launch_bounds__(256 / ZPT, GV1_ZMINB) void kernel_zpt(
+__global__ __launch_bounds__(256 / ZPT, 5) void kernel(
     const InputBuffer<uint64_t> seeds,
     OutputBuffer<SeedPos> outputs,
     const KernelSeed1::Result* __restrict__ results)
 {
   constexpr uint32_t T = 256 / ZPT;  // threads per block = z stride between a thread's rows
-  static_assert(conv_rows == 512, "kernel_zpt relies on the duplicated table (no index mask)");
   __shared__ alignas(16) ImprovedNoise oct_0A;
-#if GV1_SLIM
   // Full-score columns are read only on the 0.17% gate-pass path: one 256-row copy, masked index.
   // The conv-kernel table is read only in the per-seed build, from global through L1.
   __shared__ float conv0[4][256];
   __shared__ float conv1[4][256];
   const float (&shared_kernel_0A)[6][6][16][2] = device_kernel_0A;
-#else
-  __shared__ alignas(16) float shared_kernel_0A[6][6][16][2];
-  __shared__ float conv0[4][conv_rows];
-  __shared__ float conv1[4][conv_rows];
-#endif
   __shared__ float2 pk0[conv_rows];
   __shared__ float2 pk1[conv_rows];
   __shared__ alignas(16) uint8_t idx_xy[2][272];
 
   const uint32_t t = threadIdx.x;
-#if !GV1_SLIM
-  for (uint32_t i = t; i < 288; i += T) {
-    reinterpret_cast<uint4*>(shared_kernel_0A)[i] = reinterpret_cast<const uint4*>(device_kernel_0A)[i];
-  }
-#endif
 
   const uint32_t seeds_len = *seeds.len;
   for (uint32_t seed_index = blockIdx.x; seed_index < seeds_len; seed_index += gridDim.x) {
@@ -1136,9 +826,7 @@ __global__ __launch_bounds__(256 / ZPT, GV1_ZMINB) void kernel_zpt(
 #pragma unroll
       for (uint32_t copy = 0; copy < 2; ++copy) {
         const uint32_t r = nz + copy * 256;
-#if GV1_SLIM
         if (copy == 0)
-#endif
         {
         conv0[0][r] = c0[0]; conv0[1][r] = c0[1]; conv0[2][r] = c0[4]; conv0[3][r] = c0[5];
         conv1[0][r] = c1[0]; conv1[1][r] = c1[1]; conv1[2][r] = c1[4]; conv1[3][r] = c1[5];
@@ -1164,14 +852,12 @@ __global__ __launch_bounds__(256 / ZPT, GV1_ZMINB) void kernel_zpt(
     uchar4 c1_0 = *reinterpret_cast<const uchar4*>(&idx_xy[1][0]);
     uchar4 c1_1 = *reinterpret_cast<const uchar4*>(&idx_xy[1][4]);
 
-#if GV1_CARRY
     float2 carry0[ZPT], carry1[ZPT];  // g[8] of a group (index nx+10) is g[0] of the next
 #pragma unroll
     for (uint32_t k = 0; k < ZPT; ++k) {
       carry0[k] = pk0[idx_xy[0][2] + t + k * T];
       carry1[k] = pk1[idx_xy[1][2] + t + k * T];
     }
-#endif
     for (int32_t nx = 0; nx < 256; nx += 8) {
       // one 8-byte load per row brings the next 8 index bytes (nx+8 .. nx+15)
       const uint2 n0 = *reinterpret_cast<const uint2*>(&idx_xy[0][nx + 8]);
@@ -1188,17 +874,12 @@ __global__ __launch_bounds__(256 / ZPT, GV1_ZMINB) void kernel_zpt(
       for (uint32_t k = 0; k < ZPT; ++k) {
         const uint32_t off = k * T;  // compile-time row offset
         float2 g0[9], g1[9];
-#if GV1_CARRY
         g0[0] = carry0[k];
         g1[0] = carry1[k];
 #pragma unroll
         for (int j = 1; j < 9; ++j) { g0[j] = pk0[w0[j + 2] + off]; g1[j] = pk1[w1[j + 2] + off]; }
         carry0[k] = g0[8];
         carry1[k] = g1[8];
-#else
-#pragma unroll
-        for (int j = 0; j < 9; ++j) { g0[j] = pk0[w0[j + 2] + off]; g1[j] = pk1[w1[j + 2] + off]; }
-#endif
         uint32_t pass_mask = 0;
 #pragma unroll
         for (int c = 0; c < 8; ++c) {
@@ -1210,18 +891,18 @@ __global__ __launch_bounds__(256 / ZPT, GV1_ZMINB) void kernel_zpt(
           for (int c = 0; c < 8; ++c) {
             if (pass_mask & (1u << c)) {
               float score = 0.0f;
-              score += conv0[0][GV1_CI(w0[c] + off)];
-              score += conv1[0][GV1_CI(w1[c] + off)];
-              score += conv0[1][GV1_CI(w0[c + 1] + off)];
-              score += conv1[1][GV1_CI(w1[c + 1] + off)];
+              score += conv0[0][(w0[c] + off) & 0xFF];
+              score += conv1[0][(w1[c] + off) & 0xFF];
+              score += conv0[1][(w0[c + 1] + off) & 0xFF];
+              score += conv1[1][(w1[c + 1] + off) & 0xFF];
               score += g0[c].x;
               score += g1[c].x;
               score += g0[c + 1].y;
               score += g1[c + 1].y;
-              score += conv0[2][GV1_CI(w0[c + 4] + off)];
-              score += conv1[2][GV1_CI(w1[c + 4] + off)];
-              score += conv0[3][GV1_CI(w0[c + 5] + off)];
-              score += conv1[3][GV1_CI(w1[c + 5] + off)];
+              score += conv0[2][(w0[c + 4] + off) & 0xFF];
+              score += conv1[2][(w1[c + 4] + off) & 0xFF];
+              score += conv0[3][(w0[c + 5] + off) & 0xFF];
+              score += conv1[3][(w1[c + 5] + off) & 0xFF];
               if (score > kGradVecs1FinalThreshold) {
                 const uint32_t res_idx = atomicAdd(outputs.len, 1);
                 if (res_idx < outputs.max_len) {
@@ -1242,11 +923,7 @@ void run(
     const KernelSeed1::Result* __restrict__ results,
     cudaStream_t stream)
 {
-#if GV1_ZPT > 1
-  kernel_zpt<GV1_ZPT><<<2048, 256 / GV1_ZPT, 0, stream>>>(seeds, outputs, results);
-#else
-  kernel<<<2048, block_dim_x, 0, stream>>>(seeds, outputs, results);
-#endif
+  kernel<2><<<2048, 128, 0, stream>>>(seeds, outputs, results);
   TRY_CUDA(cudaGetLastError());
 }
 } // namespace KernelFilterGradVecs1
@@ -1611,9 +1288,6 @@ void Template<NoiseThreshold, Octaves, PosRange, Samples, MinCount, FlippedSpars
 } // namespace KernelFilter2
 
 
-#ifndef F2_PAIRS
-#define F2_PAIRS 1
-#endif
 // Permutation stored as byte pairs q[i] = p[i] | p[(i+1)&255] << 8. Every p[] lookup in a noise
 // cell comes as an (i, i+1) pair, so a cell needs 7 shared loads instead of 14 (filter_2_01a/b are
 // LSU-issue bound). Built by each warp from the global ImprovedNoise in the copy it already does.
@@ -1648,11 +1322,6 @@ __device__ __forceinline__ void compute_cell_q(const PairNoise &noise, int32_t i
   c100 = k10 & 0xFF; c101 = k10 >> 8;
   c110 = k11 & 0xFF; c111 = k11 >> 8;
 }
-#if F2_PAIRS
-#define F2_CELL compute_cell_q
-#else
-#define F2_CELL compute_cell
-#endif
 // cactus was here :)
 namespace KernelFilter2_0A {
 using T = KernelFilter2::Template<-5500, 3, 8 * 1024, 256, 27, false, false, true>;
@@ -1673,22 +1342,6 @@ constexpr float if1 = (float)cfg1.input_factor;
 constexpr float vf0 = (float)cfg0.value_factor * grad_scale_comp;
 constexpr float vf1 = (float)cfg1.value_factor * grad_scale_comp;
 
-__device__ inline void compute_cell(const ImprovedNoise &noise, int32_t int_x, int32_t int_y, int32_t int_z, uint8_t &c000, uint8_t &c100, uint8_t &c010, uint8_t &c110, uint8_t &c001, uint8_t &c101, uint8_t &c011, uint8_t &c111) {
-  uint8_t p0 = noise.p[(int_x) & 0xFF];
-  uint8_t p1 = noise.p[(int_x + 1) & 0xFF];
-  uint8_t p00 = noise.p[(p0 + int_y) & 0xFF];
-  uint8_t p01 = noise.p[(p0 + int_y + 1) & 0xFF];
-  uint8_t p10 = noise.p[(p1 + int_y) & 0xFF];
-  uint8_t p11 = noise.p[(p1 + int_y + 1) & 0xFF];
-  c000 = noise.p[(p00 + int_z) & 0xFF];
-  c100 = noise.p[(p10 + int_z) & 0xFF];
-  c010 = noise.p[(p01 + int_z) & 0xFF];
-  c110 = noise.p[(p11 + int_z) & 0xFF];
-  c001 = noise.p[(p00 + int_z + 1) & 0xFF];
-  c101 = noise.p[(p10 + int_z + 1) & 0xFF];
-  c011 = noise.p[(p01 + int_z + 1) & 0xFF];
-  c111 = noise.p[(p11 + int_z + 1) & 0xFF];
-}
 
 __device__ inline float interp(const GradDotTable &table, float frac_x, float frac_y, float frac_z, float fx, float fy, float fz, uint8_t c000, uint8_t c100, uint8_t c010, uint8_t c110, uint8_t c001, uint8_t c101, uint8_t c011, uint8_t c111) {
   float n000 = gradDot(table, c000, frac_x, frac_y, frac_z);
@@ -1704,13 +1357,8 @@ __device__ inline float interp(const GradDotTable &table, float frac_x, float fr
 
 __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
   __shared__ GradDotTable shared_grad_dot_table;
-#if F2_PAIRS
   __shared__ PairNoise s_oct0[warps_per_block];
   __shared__ PairNoise s_oct1[warps_per_block];
-#else
-  __shared__ ImprovedNoise s_oct0[warps_per_block];
-  __shared__ ImprovedNoise s_oct1[warps_per_block];
-#endif
 
   for (uint32_t i = threadIdx.x; i < sizeof(shared_grad_dot_table) / sizeof(uint32_t); i += threads_per_block) {
     reinterpret_cast<uint32_t *>(&shared_grad_dot_table)[i] = reinterpret_cast<uint32_t *>(&device_grad_dot_table)[i];
@@ -1728,30 +1376,14 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
   const uint32_t z_index = lane >> 1;
   const uint32_t x_start = (lane & 1u) * 8u;
 
-#if !F2_PAIRS
-  constexpr uint32_t words = sizeof(ImprovedNoise) / sizeof(uint32_t);
-#endif
 
   uint32_t inputs_len = *inputs.len;
   for (uint32_t input_index = warp_global; input_index < inputs_len; input_index += num_warps) {
     const SeedPos input = inputs.data[input_index];
     const uint32_t seed_index = input.seed_index;
 
-#if F2_PAIRS
     load_pairs(oct0, results[seed_index].continentalness_0A, lane);
     load_pairs(oct1, results[seed_index].continentalness_1A, lane);
-#else
-    {
-      const uint32_t *src0 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_0A);
-      const uint32_t *src1 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_1A);
-      uint32_t *dst0 = reinterpret_cast<uint32_t *>(&oct0);
-      uint32_t *dst1 = reinterpret_cast<uint32_t *>(&oct1);
-      for (uint32_t i = lane; i < words; i += 32) {
-        dst0[i] = src0[i];
-        dst1[i] = src1[i];
-      }
-    }
-#endif
     __syncwarp();
 
     const int32_t z_world = input.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
@@ -1791,7 +1423,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
       const int32_t int_x0 = __float2int_rd(x0c);
       const float frac_x0 = x0c - (float)int_x0;
       if (!have0 || int_x0 != cur_ix0) {
-        F2_CELL(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
+        compute_cell_q(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
         cur_ix0 = int_x0;
         have0 = true;
       }
@@ -1802,7 +1434,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
       const int32_t int_x1 = __float2int_rd(x1c);
       const float frac_x1 = x1c - (float)int_x1;
       if (!have1 || int_x1 != cur_ix1) {
-        F2_CELL(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
+        compute_cell_q(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
         cur_ix1 = int_x1;
         have1 = true;
       }
@@ -1852,22 +1484,6 @@ constexpr float if1 = (float)cfg1.input_factor;
 constexpr float vf0 = (float)cfg0.value_factor * grad_scale_comp;
 constexpr float vf1 = (float)cfg1.value_factor * grad_scale_comp;
 
-__device__ inline void compute_cell(const ImprovedNoise &noise, int32_t int_x, int32_t int_y, int32_t int_z, uint8_t &c000, uint8_t &c100, uint8_t &c010, uint8_t &c110, uint8_t &c001, uint8_t &c101, uint8_t &c011, uint8_t &c111) {
-  uint8_t p0 = noise.p[(int_x) & 0xFF];
-  uint8_t p1 = noise.p[(int_x + 1) & 0xFF];
-  uint8_t p00 = noise.p[(p0 + int_y) & 0xFF];
-  uint8_t p01 = noise.p[(p0 + int_y + 1) & 0xFF];
-  uint8_t p10 = noise.p[(p1 + int_y) & 0xFF];
-  uint8_t p11 = noise.p[(p1 + int_y + 1) & 0xFF];
-  c000 = noise.p[(p00 + int_z) & 0xFF];
-  c100 = noise.p[(p10 + int_z) & 0xFF];
-  c010 = noise.p[(p01 + int_z) & 0xFF];
-  c110 = noise.p[(p11 + int_z) & 0xFF];
-  c001 = noise.p[(p00 + int_z + 1) & 0xFF];
-  c101 = noise.p[(p10 + int_z + 1) & 0xFF];
-  c011 = noise.p[(p01 + int_z + 1) & 0xFF];
-  c111 = noise.p[(p11 + int_z + 1) & 0xFF];
-}
 
 __device__ inline float interp(const GradDotTable &table, float frac_x, float frac_y, float frac_z, float fx, float fy, float fz, uint8_t c000, uint8_t c100, uint8_t c010, uint8_t c110, uint8_t c001, uint8_t c101, uint8_t c011, uint8_t c111) {
   float n000 = gradDot(table, c000, frac_x, frac_y, frac_z);
@@ -1883,13 +1499,8 @@ __device__ inline float interp(const GradDotTable &table, float frac_x, float fr
 
 __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
   __shared__ GradDotTable shared_grad_dot_table;
-#if F2_PAIRS
   __shared__ PairNoise s_oct0[warps_per_block];
   __shared__ PairNoise s_oct1[warps_per_block];
-#else
-  __shared__ ImprovedNoise s_oct0[warps_per_block];
-  __shared__ ImprovedNoise s_oct1[warps_per_block];
-#endif
 
   for (uint32_t i = threadIdx.x; i < sizeof(shared_grad_dot_table) / sizeof(uint32_t); i += threads_per_block) {
     reinterpret_cast<uint32_t *>(&shared_grad_dot_table)[i] = reinterpret_cast<uint32_t *>(&device_grad_dot_table)[i];
@@ -1907,30 +1518,14 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
   const uint32_t z_index = lane >> 1;
   const uint32_t x_start = (lane & 1u) * 8u;
 
-#if !F2_PAIRS
-  constexpr uint32_t words = sizeof(ImprovedNoise) / sizeof(uint32_t);
-#endif
 
   uint32_t inputs_len = *inputs.len;
   for (uint32_t input_index = warp_global; input_index < inputs_len; input_index += num_warps) {
     const SeedPos input = inputs.data[input_index];
     const uint32_t seed_index = input.seed_index;
 
-#if F2_PAIRS
     load_pairs(oct0, results[seed_index].continentalness_0B, lane);
     load_pairs(oct1, results[seed_index].continentalness_1B, lane);
-#else
-    {
-      const uint32_t *src0 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_0B);
-      const uint32_t *src1 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_1B);
-      uint32_t *dst0 = reinterpret_cast<uint32_t *>(&oct0);
-      uint32_t *dst1 = reinterpret_cast<uint32_t *>(&oct1);
-      for (uint32_t i = lane; i < words; i += 32) {
-        dst0[i] = src0[i];
-        dst1[i] = src1[i];
-      }
-    }
-#endif
     __syncwarp();
 
     const int32_t z_world = input.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
@@ -1969,7 +1564,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
       const int32_t int_x0 = __float2int_rd(x0c);
       const float frac_x0 = x0c - (float)int_x0;
       if (!have0 || int_x0 != cur_ix0) {
-        F2_CELL(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
+        compute_cell_q(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
         cur_ix0 = int_x0;
         have0 = true;
       }
@@ -1980,7 +1575,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
       const int32_t int_x1 = __float2int_rd(x1c);
       const float frac_x1 = x1c - (float)int_x1;
       if (!have1 || int_x1 != cur_ix1) {
-        F2_CELL(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
+        compute_cell_q(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
         cur_ix1 = int_x1;
         have1 = true;
       }
@@ -2119,10 +1714,7 @@ void GpuThread::run() {
   std::printf("Initializing device %d\n", device);
 
   TRY_CUDA(cudaSetDevice(device));
-  TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-#if GV1_ZPT > 1
-  TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel_zpt<GV1_ZPT>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-#endif
+  TRY_CUDA(cudaFuncSetAttribute(reinterpret_cast<const void *>(&KernelFilterGradVecs1::kernel<2>), cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   init_grad_dot_table();
   init_conv_kernels();
 
@@ -2140,6 +1732,9 @@ void GpuThread::run() {
   DeviceBuffer buffer_late_init_flags(sizeof(uint32_t) * KernelSeed1::threads_per_run);
   DeviceBuffer buffer_1(UINT32_C(1) << 31);
   DeviceBuffer buffer_2(UINT32_C(1) << 29);
+  // filter_2_01b used to compact in place over its own input (buffer_2): a warp could overwrite an
+  // input entry another warp had not read yet. Its output is small, so it gets its own buffer.
+  DeviceBuffer buffer_3(UINT32_C(1) << 26);
   std::vector<SeedPos> h_buffer;
   std::array<GpuOutput, 64> recent_outputs{};
   size_t recent_next = 0;
@@ -2165,7 +1760,7 @@ void GpuThread::run() {
   OutputBuffer<SeedPos> outputs_filter_gradvecs_2(buffer_2, &device_buffer_lens->results_len_filter_gradvecs_2);
   auto &stage_filter_gradvecs_2 = stage_stats.emplace_back("filter_gradvecs_2", stage_filter_2_0a.outputs_len, &host_buffer_lens.results_len_filter_gradvecs_2, KernelFilterGradVecs2::threads_per_seed, outputs_filter_gradvecs_2.max_len);
 
-  OutputBuffer<SeedPos> outputs_filter_2_0b(buffer_2, &device_buffer_lens->results_len_filter_2_0b);
+  OutputBuffer<SeedPos> outputs_filter_2_0b(buffer_3, &device_buffer_lens->results_len_filter_2_0b);
   auto &stage_filter_2_0b = stage_stats.emplace_back("filter_2_01b", stage_filter_gradvecs_2.outputs_len, &host_buffer_lens.results_len_filter_2_0b, 1, outputs_filter_2_0b.max_len);
 
   auto &stage_init_seeds_late_1 = stage_stats.emplace_back("init_seeds_late_1", stage_filter_2_0b.outputs_len, stage_filter_2_0b.outputs_len, 1, outputs_filter_2_0b.max_len);

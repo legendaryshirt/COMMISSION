@@ -11,4 +11,4 @@ tmp=$(mktemp -d)
   make -B -s NO_NET=1 MAX_ITERS="$ITERS" PRINT_INTERVAL="$ITERS" "$@" >/dev/null
   cp "$(ls -t main-* | head -1)" "$tmp/bench-bin"
 } 9>/tmp/commission-build.lock
-"$tmp/bench-bin" --start "$START" --output /tmp/commission-bench-out.txt | grep -v -E '^(Initializing|Running)'
+"$tmp/bench-bin" --pipelines 1 --start "$START" --output /tmp/commission-bench-out.txt | grep -v -E '^(Initializing|Running)'
