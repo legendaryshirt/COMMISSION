@@ -126,3 +126,24 @@ All three hot kernels are at a measured hardware limit for their current algorit
 filter_seeds on ALU-pipe integer ops, gv1 on issue/LSU (balanced), filter_2_01a on LSU issue
 (balanced against ALU issue). Every remaining idea tried costs as much as it saves. Further big
 gains would need a different algorithm (e.g. a cheaper exact pre-test in front of gv1), not tuning.
+
+## Speed-of-light accounting (2026-11-06, after the make-it-fast pass)
+Bound = the minimum work an exact implementation of each funnel stage must do, against the measured
+Ada limits (60 SMs at 2.63 GHz: ALU pipe 64 lanes/clk/SM, LSU ~0.5 warp-instr/clk/SM, issue 4/clk/SM).
+
+| stage | binding pipe (ncu) | floor | now (1 pipeline, 512 it) | gap |
+|---|---|--:|--:|--:|
+| filter_seeds | ALU 96% | ~88 ALU ops/seed first test + ~0.22 x 50 dense = ~101/seed: ~1.20 s | 1.58 s (133 ops/seed) | 1.32x |
+| gradvecs_1 | LSU 88% | 2.0 gate loads/warp-cand + ~0.2 build at 100% LSU: ~1.25 s | 1.88 s (2.58 LSU/warp-cand) | 1.50x |
+| filter_2_01a | issue 84% | ~0.75 s (estimate) | 1.03 s | ~1.37x |
+| rest (gv2, 2_01b, 2a-2d, inits) | latency | ~0.4 s, mostly hidden by the 2nd pipeline | ~0.57 s | — |
+| **total** | | **~3.6 s** | **5.07 s, ~4.93 s-equivalent with 2 pipelines** | **~1.37x** |
+
+The card is now at its 285 W board power limit at 100% utilization.
+What's left in each gap, with estimates:
+- filter_seeds: dense-pass divergence on tests 3..6 (~9% of its ALU). A second-level queue cost more
+  than it saved; an exact integer threshold for test 1 would save ~2 of 133 ops (~1.5%).
+- gradvecs_1: the 0.58 LSU/warp-cand above the floor is the build (conv-kernel table via L1, p[] byte
+  loads) plus index loads. Cutting it means building the conv rows cooperatively per seed, ~5-10% of gv1.
+- filter_2_01a: per-sample FP work. The exact y/z hoist (F2_PRE) gave only 1.2%. The rest is lerps and
+  smoothstep, already minimal for the exact formulation.
