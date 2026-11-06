@@ -26,6 +26,11 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | gv1: gate pass bits as a predicate mask + one warp `any` (GV1_MASK) | — | 2246 (ref 2258) | — | 5550 (ref 5559) | 24.77 | kept: −0.5% gv1, exact |
 | gv1: uint32 pre-scaled gate offsets via broadcast LDS.128 (GV1_IDX32) | — | 2926 (ref 2246) | — | 6219 | 22.10 | **rejected, +30% gv1** |
 | f2: pair table extended with gradient words (uint2 per entry, 7 LDS per cell instead of 15; F2_G2) | — | — | 1134 (ref 1023) | 5667 (ref 5547) | 24.25 | **rejected, +11% 2_01a**: build cost (9 LDS + 4 STS.128 per lane per octave) and 5 KB/warp smem (33% occupancy) outweigh it |
+| gv1: 2 z-rows per thread (index unpacked once, 2nd row = +immediate), GV1_ZPT=2 | — | 2191 (ref 2254) | — | 5501 | 24.98 | kept (ZPT=4: 2857, rejected; occupancy 6 warps/SM) |
+| gv1: full-score columns single 256-row copy + mask, conv-kernel table via L1 (GV1_SLIM): smem 30 → 17 KB, 5 blocks/SM | — | 2105 | — | 5418 | 25.37 | kept |
+| gv1: next 8 index bytes per row as one 8-byte load | — | 2002 | — | 5314 | 25.86 | kept |
+| gv1: conv-kernel table re-laid out for 16-byte loads | — | 2012 | — | 5323 | 25.82 | rejected (same wavefronts) |
+| gv1: carry gate entry across groups (8 loads/8 cand) + `__launch_bounds__(128,5)` | — | **1878** | — | **5185** | **26.51** | **kept** (without the bound: 1991, regs > 102 cost a block) |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
@@ -104,7 +109,7 @@ Ada's ALU pipe (LOP3/SHF/IADD3) does 64 lanes/clk/SM. The SASS has about 150 ALU
 (84 LOP3, 44 SHF.L.W rotates, ...), which is about 64/clk/SM at the measured 73 G seeds/s. It sits
 on that roofline, so only removing ops helps.
 
-## Cumulative (2026-11-06, golden default): 20.88 -> 24.72 G seeds/s (+18.4%) at identical funnel output.
+## Cumulative (2026-11-06, golden default): 20.88 -> 26.51 G seeds/s (+27.0%) at identical funnel output.
 
 ## Why FS_COMPACT works
 With 21.7% passing the first test, P(some lane of 32 passes) = 99.96%, so under per-lane branching
@@ -112,7 +117,7 @@ every lane paid for the second-stage forks. Survivors are now queued per warp in
 re-run 32 at a time; the dense pass repeats the cheap first test and recomputes the 2 mix64s. A
 longer chain amortizes the flush of the partial queue at the end.
 
-## Where things stand (2026-11-06)
+## Where things stood before the speed-of-light pass (2026-11-06, superseded below)
 All three hot kernels are at a measured hardware limit for their current algorithms:
 filter_seeds on ALU-pipe integer ops, gv1 on issue/LSU (balanced), filter_2_01a on LSU issue
 (balanced against ALU issue). Every remaining idea tried costs as much as it saves. Further big

@@ -1032,13 +1032,198 @@ __launch_bounds__(block_dim_x, GV1_MINB) void kernel(
   }
 }
 
+
+#ifndef GV1_ZPT
+#define GV1_ZPT 2
+#endif
+// ZPT z-rows per thread, spaced 256/ZPT apart. Each candidate index v + nz is unpacked once per
+// thread and reused for every row: row k's address is the same register + k*(256/ZPT) rows,
+// a compile-time immediate. Values, tables and summation order are those of `kernel`.
+#ifndef GV1_CARRY
+#define GV1_CARRY 1
+#endif
+#ifndef GV1_ZMINB
+#define GV1_ZMINB 5
+#endif
+#ifndef GV1_SLIM
+#define GV1_SLIM 1
+#endif
+#if GV1_SLIM
+#define GV1_CI(i) ((i) & 0xFF)
+#else
+#define GV1_CI(i) (i)
+#endif
+template <uint32_t ZPT>
+__global__ __launch_bounds__(256 / ZPT, GV1_ZMINB) void kernel_zpt(
+    const InputBuffer<uint64_t> seeds,
+    OutputBuffer<SeedPos> outputs,
+    const KernelSeed1::Result* __restrict__ results)
+{
+  constexpr uint32_t T = 256 / ZPT;  // threads per block = z stride between a thread's rows
+  static_assert(conv_rows == 512, "kernel_zpt relies on the duplicated table (no index mask)");
+  __shared__ alignas(16) ImprovedNoise oct_0A;
+#if GV1_SLIM
+  // Full-score columns are read only on the 0.17% gate-pass path: one 256-row copy, masked index.
+  // The conv-kernel table is read only in the per-seed build, from global through L1.
+  __shared__ float conv0[4][256];
+  __shared__ float conv1[4][256];
+  const float (&shared_kernel_0A)[6][6][16][2] = device_kernel_0A;
+#else
+  __shared__ alignas(16) float shared_kernel_0A[6][6][16][2];
+  __shared__ float conv0[4][conv_rows];
+  __shared__ float conv1[4][conv_rows];
+#endif
+  __shared__ float2 pk0[conv_rows];
+  __shared__ float2 pk1[conv_rows];
+  __shared__ alignas(16) uint8_t idx_xy[2][272];
+
+  const uint32_t t = threadIdx.x;
+#if !GV1_SLIM
+  for (uint32_t i = t; i < 288; i += T) {
+    reinterpret_cast<uint4*>(shared_kernel_0A)[i] = reinterpret_cast<const uint4*>(device_kernel_0A)[i];
+  }
+#endif
+
+  const uint32_t seeds_len = *seeds.len;
+  for (uint32_t seed_index = blockIdx.x; seed_index < seeds_len; seed_index += gridDim.x) {
+    __syncthreads();
+    if (t < 17) {
+      reinterpret_cast<uint4*>(&oct_0A)[t] = reinterpret_cast<const uint4*>(&results[seed_index].continentalness_0A)[t];
+    }
+    __syncthreads();
+
+    const int32_t ny = oct_0A.yo;
+#pragma unroll
+    for (uint32_t k = 0; k < ZPT; ++k) {
+      const uint32_t nz = t + k * T;
+      uint32_t p_z[6];
+#pragma unroll
+      for (int32_t dnz = 0; dnz < 6; ++dnz) p_z[dnz] = oct_0A.p[(nz + dnz) & 0xFF] & 0xF;
+      float c0[6], c1[6];
+#pragma unroll
+      for (int32_t dnx = 0; dnx < 6; ++dnx) {
+        float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+        for (int32_t dnz = 0; dnz < 6; ++dnz) {
+          a0 += shared_kernel_0A[dnx][dnz][p_z[dnz]][0];
+          a1 += shared_kernel_0A[dnx][dnz][p_z[dnz]][1];
+        }
+        c0[dnx] = a0; c1[dnx] = a1;
+      }
+#pragma unroll
+      for (uint32_t copy = 0; copy < 2; ++copy) {
+        const uint32_t r = nz + copy * 256;
+#if GV1_SLIM
+        if (copy == 0)
+#endif
+        {
+        conv0[0][r] = c0[0]; conv0[1][r] = c0[1]; conv0[2][r] = c0[4]; conv0[3][r] = c0[5];
+        conv1[0][r] = c1[0]; conv1[1][r] = c1[1]; conv1[2][r] = c1[4]; conv1[3][r] = c1[5];
+        }
+        pk0[r] = make_float2(c0[2], c0[3]);
+        pk1[r] = make_float2(c1[2], c1[3]);
+      }
+      const uint8_t idx_x = oct_0A.p[nz];
+      const uint8_t v0 = oct_0A.p[(idx_x + ny) & 0xFF];
+      const uint8_t v1 = oct_0A.p[(idx_x + ny + 1) & 0xFF];
+      idx_xy[0][nz] = v0;
+      idx_xy[1][nz] = v1;
+      if (nz < 6) { idx_xy[0][256 + nz] = v0; idx_xy[1][256 + nz] = v1; }
+    }
+
+    const int32_t cell_size = 512 * large_biomes_pos_mul;
+    const int32_t x_center = (2.5f - oct_0A.xo) * cell_size;
+    const int32_t z_center = (2.5f - oct_0A.zo) * cell_size;
+    __syncthreads();
+
+    uchar4 c0_0 = *reinterpret_cast<const uchar4*>(&idx_xy[0][0]);
+    uchar4 c0_1 = *reinterpret_cast<const uchar4*>(&idx_xy[0][4]);
+    uchar4 c1_0 = *reinterpret_cast<const uchar4*>(&idx_xy[1][0]);
+    uchar4 c1_1 = *reinterpret_cast<const uchar4*>(&idx_xy[1][4]);
+
+#if GV1_CARRY
+    float2 carry0[ZPT], carry1[ZPT];  // g[8] of a group (index nx+10) is g[0] of the next
+#pragma unroll
+    for (uint32_t k = 0; k < ZPT; ++k) {
+      carry0[k] = pk0[idx_xy[0][2] + t + k * T];
+      carry1[k] = pk1[idx_xy[1][2] + t + k * T];
+    }
+#endif
+    for (int32_t nx = 0; nx < 256; nx += 8) {
+      // one 8-byte load per row brings the next 8 index bytes (nx+8 .. nx+15)
+      const uint2 n0 = *reinterpret_cast<const uint2*>(&idx_xy[0][nx + 8]);
+      const uint2 n1 = *reinterpret_cast<const uint2*>(&idx_xy[1][nx + 8]);
+      const uchar4 c0_2 = *reinterpret_cast<const uchar4*>(&n0.x), c0_3 = *reinterpret_cast<const uchar4*>(&n0.y);
+      const uchar4 c1_2 = *reinterpret_cast<const uchar4*>(&n1.x), c1_3 = *reinterpret_cast<const uchar4*>(&n1.y);
+      const uint8_t r0[13] = {c0_0.x, c0_0.y, c0_0.z, c0_0.w, c0_1.x, c0_1.y, c0_1.z, c0_1.w, c0_2.x, c0_2.y, c0_2.z, c0_2.w, c0_3.x};
+      const uint8_t r1[13] = {c1_0.x, c1_0.y, c1_0.z, c1_0.w, c1_1.x, c1_1.y, c1_1.z, c1_1.w, c1_2.x, c1_2.y, c1_2.z, c1_2.w, c1_3.x};
+      uint32_t w0[13], w1[13];
+#pragma unroll
+      for (int j = 0; j < 13; ++j) { w0[j] = r0[j] + t; w1[j] = r1[j] + t; }
+
+#pragma unroll
+      for (uint32_t k = 0; k < ZPT; ++k) {
+        const uint32_t off = k * T;  // compile-time row offset
+        float2 g0[9], g1[9];
+#if GV1_CARRY
+        g0[0] = carry0[k];
+        g1[0] = carry1[k];
+#pragma unroll
+        for (int j = 1; j < 9; ++j) { g0[j] = pk0[w0[j + 2] + off]; g1[j] = pk1[w1[j + 2] + off]; }
+        carry0[k] = g0[8];
+        carry1[k] = g1[8];
+#else
+#pragma unroll
+        for (int j = 0; j < 9; ++j) { g0[j] = pk0[w0[j + 2] + off]; g1[j] = pk1[w1[j + 2] + off]; }
+#endif
+        uint32_t pass_mask = 0;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          const float gate = g0[c].x + g0[c + 1].y + g1[c].x + g1[c + 1].y;
+          pass_mask |= (gate >= kGradVecs1PrefilterThreshold ? 1u : 0u) << c;
+        }
+        if (__any_sync(0xFFFFFFFFu, pass_mask != 0)) {
+#pragma unroll
+          for (int c = 0; c < 8; ++c) {
+            if (pass_mask & (1u << c)) {
+              float score = 0.0f;
+              score += conv0[0][GV1_CI(w0[c] + off)];
+              score += conv1[0][GV1_CI(w1[c] + off)];
+              score += conv0[1][GV1_CI(w0[c + 1] + off)];
+              score += conv1[1][GV1_CI(w1[c + 1] + off)];
+              score += g0[c].x;
+              score += g1[c].x;
+              score += g0[c + 1].y;
+              score += g1[c + 1].y;
+              score += conv0[2][GV1_CI(w0[c + 4] + off)];
+              score += conv1[2][GV1_CI(w1[c + 4] + off)];
+              score += conv0[3][GV1_CI(w0[c + 5] + off)];
+              score += conv1[3][GV1_CI(w1[c + 5] + off)];
+              if (score > kGradVecs1FinalThreshold) {
+                const uint32_t res_idx = atomicAdd(outputs.len, 1);
+                if (res_idx < outputs.max_len) {
+                  outputs.data[res_idx] = {seed_index, x_center + (nx + c) * cell_size, z_center + (int32_t)(t + off) * cell_size};
+                }
+              }
+            }
+          }
+        }
+      }
+      c0_0 = c0_2; c0_1 = c0_3; c1_0 = c1_2; c1_1 = c1_3;
+    }
+  }
+}
 void run(
     const InputBuffer<uint64_t> seeds,
     OutputBuffer<SeedPos> outputs,
     const KernelSeed1::Result* __restrict__ results,
     cudaStream_t stream)
 {
+#if GV1_ZPT > 1
+  kernel_zpt<GV1_ZPT><<<2048, 256 / GV1_ZPT, 0, stream>>>(seeds, outputs, results);
+#else
   kernel<<<2048, block_dim_x, 0, stream>>>(seeds, outputs, results);
+#endif
   TRY_CUDA(cudaGetLastError());
 }
 } // namespace KernelFilterGradVecs1
@@ -1912,6 +2097,9 @@ void GpuThread::run() {
 
   TRY_CUDA(cudaSetDevice(device));
   TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+#if GV1_ZPT > 1
+  TRY_CUDA(cudaFuncSetAttribute(KernelFilterGradVecs1::kernel_zpt<GV1_ZPT>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+#endif
   init_grad_dot_table();
   init_conv_kernels();
 
