@@ -32,6 +32,8 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | gv1: conv-kernel table re-laid out for 16-byte loads | — | 2012 | — | 5323 | 25.82 | rejected (same wavefronts) |
 | gv1: carry gate entry across groups (8 loads/8 cand) + `__launch_bounds__(128,5)` | — | **1878** | — | **5185** | **26.51** | **kept** (without the bound: 1991, regs > 102 cost a block) |
 | filter_seeds: queue first-test state (seed, RNG after fork, a-yo fork, score) so the dense pass resumes instead of recomputing ~85 ALU ops/survivor | **1584** (ref 1699) | 1880 | — | **5075** | **27.08** | **kept: −6.8% seeds, counts identical** |
+| filter_seeds: second-level queue after test 2 (test-2 survival 10.9%, but tests 3..6 ran for 97.5% of warps) | 1629 / 1608 / 1604 (TPB 256/128/64; ref 1584) | — | — | 5124-5097 | ≤26.96 | **rejected**: queue bookkeeping + flush > divergence saved; counts identical |
+| f2_01a/b: hoist gradDot's y/z part (fmaf(y,gy,z*gz)) into the cell branch, exact (F2_PRE) | — | — | 1029 (PRE+minB3) vs 1042 (minB3 only) | 5080 | 27.05 | **rejected: −1.2% of 2_01a (~0.25% total) for ~40 lines**. NB `__launch_bounds__(256,1)` alone made 2_01a +6% (more regs) |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
