@@ -19,6 +19,7 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | f2_01a/b: linear-in-x cell evaluation (F2_LINX) | — | — | 1444 | 6393 | 21.50 | rejected: no gain, count drift of 1. Removes ALU only, and the kernel is LSU-bound |
 | **gradDot packed table: 1 shared load per corner instead of 3 (byte-encoded ±2.0)** | — | — | **1115** (ref 1427) | **6053** (ref 6365) | **22.71** | **kept: 2_01a −22%, 2_01b −20%, 2a −22%, total −4.9%, all counts byte-identical** |
 | gv1 warp-uniform gate skip: per-64-row-window max of each gate term (exact, counts identical) | — | 5630 (ref 2257) | — | 9414 | 14.60 | **rejected, 2.5x slower**: the bound passes 99.999% of candidates |
+| **f2_01a/b: byte-pair permutation table, 7 shared loads per cell instead of 14** | — | — | **1021** (ref 1115) | **5958** (ref 6053) | **23.07** | **kept: 2_01a −8.4%, 2_01b −8%, total −1.6%, counts byte-identical** |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
 
 ## Profile (ncu, baseline + gv1 change)
@@ -83,7 +84,8 @@ already hoisted the gradient-table loads into the cell-change branch: dynamic sh
 216.3 M with or without F2_LINX. So only fewer loads per cell help. The packed table cuts each
 corner from 3 loads to 1 and rebuilds the components with `__byte_perm`. It stores 2*g, which is
 exact; callers multiply the octave weight by 0.5, which is also exact.
-Remaining LSU per cell: 6 uniform p[] loads + 8 corner p[] loads + 8 table loads.
+Remaining LSU per cell after the pair table: 7 q[] loads + 8 gradient-table loads. Folding gradients
+into a per-warp pair table would cost ~41 KB smem/block (2 blocks/SM); not tried.
 
 ## gv1 gate selectivity (GV1_STATS instrumentation, 2026-11-06)
 Only 0.174% of lane-candidates pass the -12 gate, and 4.9% of warp-candidates (32 z-lanes) have

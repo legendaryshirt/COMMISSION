@@ -1321,6 +1321,49 @@ void Template<NoiseThreshold, Octaves, PosRange, Samples, MinCount, FlippedSpars
 }
 } // namespace KernelFilter2
 
+
+#ifndef F2_PAIRS
+#define F2_PAIRS 1
+#endif
+// Permutation stored as byte pairs q[i] = p[i] | p[(i+1)&255] << 8. Every p[] lookup in a noise
+// cell comes as an (i, i+1) pair, so a cell needs 7 shared loads instead of 14 (filter_2_01a/b are
+// LSU-issue bound). Built by each warp from the global ImprovedNoise in the copy it already does.
+struct alignas(16) PairNoise {
+  uint16_t q[256];
+  float xo, yo, zo, pad;
+};
+
+__device__ __forceinline__ void load_pairs(PairNoise &dst, const ImprovedNoise &src, uint32_t lane) {
+  const uint32_t *w = reinterpret_cast<const uint32_t *>(src.p);
+  const uint32_t w0 = w[2 * lane], w1 = w[2 * lane + 1], w2 = w[(2 * lane + 2) & 63];
+  uint4 out;
+  out.x = __byte_perm(w0, w1, 0x2110);
+  out.y = __byte_perm(w0, w1, 0x4332);
+  out.z = __byte_perm(w1, w2, 0x2110);
+  out.w = __byte_perm(w1, w2, 0x4332);
+  reinterpret_cast<uint4 *>(dst.q)[lane] = out;
+  if (lane < 3) (&dst.xo)[lane] = (&src.xo)[lane];
+}
+
+__device__ __forceinline__ void compute_cell_q(const PairNoise &noise, int32_t int_x, int32_t int_y, int32_t int_z,
+    uint8_t &c000, uint8_t &c100, uint8_t &c010, uint8_t &c110, uint8_t &c001, uint8_t &c101, uint8_t &c011, uint8_t &c111) {
+  const uint32_t a = noise.q[int_x & 0xFF];
+  const uint32_t b0 = noise.q[((a & 0xFF) + int_y) & 0xFF];
+  const uint32_t b1 = noise.q[((a >> 8) + int_y) & 0xFF];
+  const uint32_t k00 = noise.q[((b0 & 0xFF) + int_z) & 0xFF];
+  const uint32_t k01 = noise.q[((b0 >> 8) + int_z) & 0xFF];
+  const uint32_t k10 = noise.q[((b1 & 0xFF) + int_z) & 0xFF];
+  const uint32_t k11 = noise.q[((b1 >> 8) + int_z) & 0xFF];
+  c000 = k00 & 0xFF; c001 = k00 >> 8;
+  c010 = k01 & 0xFF; c011 = k01 >> 8;
+  c100 = k10 & 0xFF; c101 = k10 >> 8;
+  c110 = k11 & 0xFF; c111 = k11 >> 8;
+}
+#if F2_PAIRS
+#define F2_CELL compute_cell_q
+#else
+#define F2_CELL compute_cell
+#endif
 // cactus was here :)
 namespace KernelFilter2_0A {
 using T = KernelFilter2::Template<-5500, 3, 8 * 1024, 256, 27, false, false, true>;
@@ -1372,8 +1415,13 @@ __device__ inline float interp(const GradDotTable &table, float frac_x, float fr
 
 __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
   __shared__ GradDotTable shared_grad_dot_table;
+#if F2_PAIRS
+  __shared__ PairNoise s_oct0[warps_per_block];
+  __shared__ PairNoise s_oct1[warps_per_block];
+#else
   __shared__ ImprovedNoise s_oct0[warps_per_block];
   __shared__ ImprovedNoise s_oct1[warps_per_block];
+#endif
 
   for (uint32_t i = threadIdx.x; i < sizeof(shared_grad_dot_table) / sizeof(uint32_t); i += threads_per_block) {
     reinterpret_cast<uint32_t *>(&shared_grad_dot_table)[i] = reinterpret_cast<uint32_t *>(&device_grad_dot_table)[i];
@@ -1385,19 +1433,25 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
   const uint32_t warp_global = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const uint32_t num_warps = (gridDim.x * blockDim.x) >> 5;
 
-  ImprovedNoise &oct0 = s_oct0[warp_in_block];
-  ImprovedNoise &oct1 = s_oct1[warp_in_block];
+  auto &oct0 = s_oct0[warp_in_block];
+  auto &oct1 = s_oct1[warp_in_block];
 
   const uint32_t z_index = lane >> 1;
   const uint32_t x_start = (lane & 1u) * 8u;
 
+#if !F2_PAIRS
   constexpr uint32_t words = sizeof(ImprovedNoise) / sizeof(uint32_t);
+#endif
 
   uint32_t inputs_len = *inputs.len;
   for (uint32_t input_index = warp_global; input_index < inputs_len; input_index += num_warps) {
     const SeedPos input = inputs.data[input_index];
     const uint32_t seed_index = input.seed_index;
 
+#if F2_PAIRS
+    load_pairs(oct0, results[seed_index].continentalness_0A, lane);
+    load_pairs(oct1, results[seed_index].continentalness_1A, lane);
+#else
     {
       const uint32_t *src0 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_0A);
       const uint32_t *src1 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_1A);
@@ -1408,6 +1462,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
         dst1[i] = src1[i];
       }
     }
+#endif
     __syncwarp();
 
     const int32_t z_world = input.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
@@ -1447,7 +1502,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
       const int32_t int_x0 = __float2int_rd(x0c);
       const float frac_x0 = x0c - (float)int_x0;
       if (!have0 || int_x0 != cur_ix0) {
-        compute_cell(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
+        F2_CELL(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
         cur_ix0 = int_x0;
         have0 = true;
       }
@@ -1458,7 +1513,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
       const int32_t int_x1 = __float2int_rd(x1c);
       const float frac_x1 = x1c - (float)int_x1;
       if (!have1 || int_x1 != cur_ix1) {
-        compute_cell(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
+        F2_CELL(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
         cur_ix1 = int_x1;
         have1 = true;
       }
@@ -1539,8 +1594,13 @@ __device__ inline float interp(const GradDotTable &table, float frac_x, float fr
 
 __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
   __shared__ GradDotTable shared_grad_dot_table;
+#if F2_PAIRS
+  __shared__ PairNoise s_oct0[warps_per_block];
+  __shared__ PairNoise s_oct1[warps_per_block];
+#else
   __shared__ ImprovedNoise s_oct0[warps_per_block];
   __shared__ ImprovedNoise s_oct1[warps_per_block];
+#endif
 
   for (uint32_t i = threadIdx.x; i < sizeof(shared_grad_dot_table) / sizeof(uint32_t); i += threads_per_block) {
     reinterpret_cast<uint32_t *>(&shared_grad_dot_table)[i] = reinterpret_cast<uint32_t *>(&device_grad_dot_table)[i];
@@ -1552,19 +1612,25 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
   const uint32_t warp_global = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const uint32_t num_warps = (gridDim.x * blockDim.x) >> 5;
 
-  ImprovedNoise &oct0 = s_oct0[warp_in_block];
-  ImprovedNoise &oct1 = s_oct1[warp_in_block];
+  auto &oct0 = s_oct0[warp_in_block];
+  auto &oct1 = s_oct1[warp_in_block];
 
   const uint32_t z_index = lane >> 1;
   const uint32_t x_start = (lane & 1u) * 8u;
 
+#if !F2_PAIRS
   constexpr uint32_t words = sizeof(ImprovedNoise) / sizeof(uint32_t);
+#endif
 
   uint32_t inputs_len = *inputs.len;
   for (uint32_t input_index = warp_global; input_index < inputs_len; input_index += num_warps) {
     const SeedPos input = inputs.data[input_index];
     const uint32_t seed_index = input.seed_index;
 
+#if F2_PAIRS
+    load_pairs(oct0, results[seed_index].continentalness_0B, lane);
+    load_pairs(oct1, results[seed_index].continentalness_1B, lane);
+#else
     {
       const uint32_t *src0 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_0B);
       const uint32_t *src1 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_1B);
@@ -1575,6 +1641,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
         dst1[i] = src1[i];
       }
     }
+#endif
     __syncwarp();
 
     const int32_t z_world = input.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
@@ -1613,7 +1680,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
       const int32_t int_x0 = __float2int_rd(x0c);
       const float frac_x0 = x0c - (float)int_x0;
       if (!have0 || int_x0 != cur_ix0) {
-        compute_cell(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
+        F2_CELL(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
         cur_ix0 = int_x0;
         have0 = true;
       }
@@ -1624,7 +1691,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
       const int32_t int_x1 = __float2int_rd(x1c);
       const float frac_x1 = x1c - (float)int_x1;
       if (!have1 || int_x1 != cur_ix1) {
-        compute_cell(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
+        F2_CELL(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
         cur_ix1 = int_x1;
         have1 = true;
       }
