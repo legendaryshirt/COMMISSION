@@ -59,6 +59,10 @@ Before a candidate is queued for CPU verification, it's dropped if one of the la
 candidates has the same seed and lies within 1024 blocks in both x and z. The CPU window is ±12800.
 Check: a 120 s run at --size 2000000 printed 12 lines / 12 unique islands, against 32 lines /
 23 unique before. 4 candidates were dropped.
-**Still owed:** a fixed-work check. Time-limited runs verify a different subset (the single CPU
+**Fixed-work check passed (2026-11-06, job commission-dedup-check):** 4.4 T identical seeds
+from 1e12, --size 2000000, CPU queue fully drained (MAX_ITERS builds now exit through main's
+graceful SIGINT path). Without dedup: 48 lines / 37 unique islands. With dedup radius 1024: 37 lines /
+37 unique, an identical set (diff empty). So no island is lost, and 11 redundant CPU verifications are gone.
+Earlier note, kept for history: a fixed-work check was owed. Time-limited runs verify a different subset (the single CPU
 thread is the bottleneck), so the unique counts above aren't comparable. Run identical seeds with
 the CPU queue fully drained, with and without dedup, and confirm the unique island sets match.

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <csignal>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -1951,9 +1952,12 @@ void GpuThread::run() {
           // repeats the CPU work and printed duplicate lines. 1024 blocks is far inside the
           // CPU's +-12800-block verification window, so both would get the same verdict.
           bool duplicate = false;
+#ifndef DEDUP_RADIUS
+#define DEDUP_RADIUS 1024
+#endif
           for (size_t r = 0; r < std::min(recent_next, recent_outputs.size()); r++) {
             const auto &prev = recent_outputs[r];
-            if (prev.seed == out.seed && std::abs(prev.x - out.x) <= 1024 && std::abs(prev.z - out.z) <= 1024) {
+            if (prev.seed == out.seed && std::abs(prev.x - out.x) <= DEDUP_RADIUS && std::abs(prev.z - out.z) <= DEDUP_RADIUS) {
               duplicate = true;
               break;
             }
@@ -2036,8 +2040,9 @@ void GpuThread::run() {
   TRY_CUDA(cudaFree(device_buffer_lens));
 
   if constexpr (MAX_ITERS != 0) {
-    // benchmark build: fixed number of pipeline iterations, then exit the process
+    // fixed-work build: after MAX_ITERS iterations, trigger main's graceful shutdown,
+    // which lets the CPU threads drain every queued candidate before exiting
     std::fflush(stdout);
-    std::_Exit(0);
+    std::raise(SIGINT);
   }
 }
