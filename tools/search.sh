@@ -1,45 +1,43 @@
 #!/usr/bin/env bash
 # Resumable long-running search that never revisits a seed range.
-# Ledger: search/ranges.tsv (gitignored, so cnode sync never overwrites it on the node):
-#   closed_utc  build_key  first_logical  end_logical(exclusive)  islands_found
-# Ranges are in *logical* seed index (what --start takes). Under SEED_ORDER=golden, index n is
-# seed (n*GOLDEN)^SILVER, a bijection over all 2^64 seeds. Ranges only make sense within one
-# build key (order + biomes + bound), so each key resumes from its own furthest end.
+# Everything worth keeping goes to one small append-only log, search/search.log (gitignored, so
+# cnode sync never overwrites it on the node), written by tools/search_log.py:
+#   <utc> range  <type> <order> <first> <end>   logical seeds [first, end) fully searched
+#   <utc> island <type> <seed> <x> <z> <area>
+# type: sb / lb / sub / lub (small/large biomes, bounded/unbound). Ranges are in *logical*
+# seed index (what --start takes). Under SEED_ORDER=golden, index n is seed (n*GOLDEN)^SILVER,
+# a bijection over all 2^64 seeds, so ranges only make sense within one type + order: each
+# resumes from its own furthest end. A session writes a range checkpoint every 5 minutes and
+# its exact end on a graceful stop, so even a hard kill re-checks at most a few minutes and
+# never leaves a gap. The binary's per-second stage tables are not kept: search/status.json
+# holds the latest one (overwritten each minute), and search/session.txt the startup banner
+# and any errors of the current session.
 # Benchmarks use logical 1e12 upward; searches default to 2^62 upward to stay clear of them.
 # usage: tools/search.sh [extra main args, e.g. --size 11000000]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p search
 SEED_ORDER=${SEED_ORDER:-golden}; LARGE_BIOMES=${LARGE_BIOMES:-0}; UNBOUND=${UNBOUND:-0}
-KEY="${SEED_ORDER}-$([ "$LARGE_BIOMES" = 1 ] && echo lb || echo sb)-$([ "$UNBOUND" = 1 ] && echo unbound || echo bounded)"
-LEDGER=search/ranges.tsv; LOG=search/current.log; BATCH=$((1 << 28)); DEFAULT_START=$((1 << 62))
+TYPE=$([ "$UNBOUND" = 1 ] && echo u)$([ "$LARGE_BIOMES" = 1 ] && echo lb || echo sb)
+TYPE=${TYPE/usb/sub}; TYPE=${TYPE/ulb/lub}
+P=${PIPELINES:-2}; BATCH=$((1 << 28)); DEFAULT_START=$((1 << 62)); LOG=search/search.log
+[ "${1:-}" = close ] && exit 0   # kept for old callers: sessions now close themselves
 
-close_session() {   # record the range covered by a finished or killed previous session
-  [ -f "$LOG" ] || return 0
-  local key first end found
-  key=$(cat search/current.key); first=$(awk '/^Starting from/{print $3; exit}' "$LOG")
-  local st; st=$(awk '/^Start seed: /{gsub(",","",$3); print $3, $7}' "$LOG" | tail -1)
-  end=""; [ -n "$st" ] && end=$(( ${st% *} + ${st#* } ))   # bash int64: awk doubles lose bits near 2^62
-  if [ -z "$end" ]; then   # killed hard: fall back to the progress lines, conservatively
-    # Each pipeline prints every 64 of its own batches and finishes its batches in order, so
-    # every batch more than (64+1)*P batches before the newest printed one is complete. This
-    # may re-check a few seconds of seeds but never leaves a gap.
-    local p=${PIPELINES:-2}
-    end=$(awk '/^start_seed = /{s=$3} END{if (s!="") print s}' "$LOG")
-    [ -n "$end" ] && end=$((end - (64 + 1) * p * BATCH))
-    [ -n "$end" ] && [ "$end" -lt "$first" ] && end=""
-  fi
-  found=$(grep -c . search/current.found 2>/dev/null || true); found=${found:-0}
-  [ -n "$first" ] && [ -n "$end" ] && printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$key" "$first" "$end" "$found" >> "$LEDGER"
-  cat search/current.found >> search/found.txt 2>/dev/null || true
-  mv "$LOG" "search/session-$(date +%s).log"; rm -f search/current.found
-}
-close_session
-[ "${1:-}" = close ] && exit 0
-
-next=$(awk -F'\t' -v k="$KEY" '$2==k && $4>m {m=$4} END{if (m!="") print m}' "$LEDGER" 2>/dev/null || true)
-next=${next:-$DEFAULT_START}
-echo "$KEY" > search/current.key
+# Resume from the furthest end for this type + order. Compared in Python: exact 64-bit ints.
+next=$(python3 - "$LOG" "$TYPE" "$SEED_ORDER" "$DEFAULT_START" <<'EOF'
+import sys
+path, typ, order, default = sys.argv[1:5]
+end = None
+try:
+    for line in open(path):
+        p = line.rstrip("\n").split("\t")
+        if len(p) == 6 and p[1] == "range" and p[2] == typ and p[3] == order:
+            end = max(end or 0, int(p[5]))
+except FileNotFoundError:
+    pass
+print(end if end is not None else default)
+EOF
+)
 bin=main-$([ "$UNBOUND" = 1 ] && echo u)$([ "$LARGE_BIOMES" = 1 ] && echo lb || echo sb)
 # Build under the lock that tools/bench.sh also takes, and run a private copy, so a benchmark
 # build in the same tree can never replace the binary the search runs.
@@ -48,5 +46,6 @@ bin=main-$([ "$UNBOUND" = 1 ] && echo u)$([ "$LARGE_BIOMES" = 1 ] && echo lb || 
   make -s NO_NET=1 SEED_ORDER="$SEED_ORDER" LARGE_BIOMES="$LARGE_BIOMES" UNBOUND="$UNBOUND" PRINT_INTERVAL=64 MAX_ITERS=0 -B >/dev/null
   cp "$bin" search/search-bin
 } 9>/tmp/commission-build.lock
-echo "search $KEY from logical $next"
-exec ./search/search-bin --start "$next" --pipelines "${PIPELINES:-2}" --threads 4 --output search/current.found "$@" > "$LOG" 2>&1
+echo "search $TYPE $SEED_ORDER from logical $next"
+./search/search-bin --start "$next" --pipelines "$P" --threads 4 --output /dev/null "$@" 2>&1 \
+  | python3 tools/search_log.py search "$TYPE" "$SEED_ORDER" "$next" "$P" "$BATCH"
