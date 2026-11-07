@@ -36,6 +36,81 @@ gv1 386342512, 2_01a 1502284, gv2 13412604, 2_01b 412844, 2a 26736, 2b 2028, 2c 
 | f2_01a/b: hoist gradDot's y/z part (fmaf(y,gy,z*gz)) into the cell branch, exact (F2_PRE) | — | — | 1029 (PRE+minB3) vs 1042 (minB3 only) | 5080 | 27.05 | **rejected: −1.2% of 2_01a (~0.25% total) for ~40 lines**. NB `__launch_bounds__(256,1)` alone made 2_01a +6% (more regs) |
 | **2 pipelines per GPU (`--pipelines`, own stream + buffers, shared seed iterator)**: fills the latency-bound tail stages and kernel-boundary drains | 90 s wall: 2.413 T (1) -> **2.491 T (2)**, 2.498 T (3) seeds | | | | **≈27.9** | **kept, +3.2% end to end** (default 2; 3 adds only +0.3% for another ~2.9 GB) |
 | gradDot as branchless ALU instead of 3 shared-table loads | 2098 | 2321 | 2238 | 7318 | 18.78 | **rejected, 2_01a +57%** |
+| **2026-11-06 session 2, new same-session reference** (golden, 1 pipeline, `tools/bench.sh 512 1e12`). Counts: gv1 386426648, 2_01a 1503064, gv2 13432243, 2_01b 414115, 2a 27083, 2b 2216, 2c 72, 2d 3 | 1586 | 1883 | 1027 | 5082 | 27.05 | reference |
+| gv1: fp16 superset gate (tables rounded up, threshold -12.015625), exact fp32 recheck of survivors | — | 1758 | — | 4946 | 27.79 | superseded by the integer gate below |
+| gv1: integer superset gate: q = floor(-512x) as uint16, 2 z-rows per word, IADD3 adds 3 terms for 2 candidates, bit-15 fail trick (no per-candidate mask) | — | 1571 | — | 4751 | 28.93 | kept, counts identical |
+| gv1: 4 z-rows per thread (zl + 64m), one LDS.128 entry serves 4 candidates, block halves split nx, `__launch_bounds__(128,4)` | — | 1960 | — | 5131 | 26.79 | worse as-is: the unrolled exact path for 32 candidates overflowed the icache (no_instruction stalls 1.42) |
+| same, exact path compacted to a loop over pass bits | — | 1576 | — | 4750 | 28.94 | level: the exact path ran on ~86% of warp-steps (32 lanes x 32 candidates at ~0.2%) |
+| **gv1: survivors queued per warp in shared memory and re-checked exactly 32 at a time (as in filter_seeds)** | 1573 | **1033** | 1020 | **4207** | **32.67** | **kept: gv1 −45%, total −17.2% vs the session reference. All 15 stage sets (2_01a, gv2, 2_01b, 2a, 2b x sb/lb/unbound, 32 it) identical to perf HEAD** |
+| 2_01a: fast count with per-cell coefficients (n = A0 + fx(A1-A0), A_i linear in frac_x), sure/possible counts at thr -/+ 2^-12, exact upstream loop only when undecided | 1580 | 1037 | **947** | **4148** | **33.13** | kept: 2_01a −7%, all 15 stage sets identical. Now issue-bound on the per-cell setup (hash loads + coefficients, ~8 cell changes per lane) |
+| **End to end, 60 s, 2 pipelines (gv1 queue build, before the 2_01a change)**: perf HEAD 1.670 T vs 2.012 T seeds | | | | | **≈33.5** | **+20.5% real-world** |
+
+| gv2: the 12 permutation indices per grid column built once per input into shared memory (one broadcast 16-B load per step instead of 18 loads), column-major conv tables, loops swapped (z outer) | — | — | — | — | — | **kept: gv2 397 -> 179 ms (−55%) under eco**, same energy (it was a latency-bound, low-power stage), all 15 stage sets identical |
+| 2_01a: per-lane W·ty / W·tz products, octave weight folded in | — | — | 1682 vs 1683 (eco) | | | rejected: no change |
+| 2_01a: per-warp table of every cell the 16x16 grid touches (y folded, 12 floats/cell, built across lanes); lanes do 3 loads + 12 FMA per cell entered | — | — | 1850 vs 1690 (eco) | | | **rejected**: work −14% (32.7 -> 28.0 G thread-instr/it) but occupancy 16 warps (125 regs, 20 KB smem/4 warps); energy per fixed work unchanged (794 vs 793 J) |
+
+### 2026-11-07: measure energy, not time
+The GPU is always at a power cap: 285 W normally (it ran at 2715 of 3105 MHz) and 100 W in agile-power's
+eco mode. A low-power, latency-bound stage lets the clocks boost elsewhere, so shortening it can leave
+the total unchanged (gv2 above). `tools/ab.sh` now reports joules per fixed work (NVML energy counter,
+`tools/gpu_energy.py`) next to the stage times; `tools/e2e.sh` runs the real 2-pipeline search binary.
+
+| build (eco, 100 W, 512 it, mean of 3) | energy | total ms |
+|---|--:|--:|
+| perf HEAD (committed) | 1015 J | 9679 |
+| gv1 integer gate + queue, 2_01a fast count | 795 J | 7506 |
+| + gv2 index table | **793 J (−22%)** | **7311** |
+| + 2_01a cell table (rejected) | 794 J | 7528 |
+
+Further kept changes (eco, mean of 3, joules per 512 it; counts identical; all 15 stage sets identical after the first two):
+| change | stage ms | energy |
+|---|--:|--:|
+| filter_seeds: the a-fork's second state update moved into the drain (only the ~22% that pass need it); thread-instr 38.5 -> 37.1 G/it | seeds 2906 -> 2715 | 788 -> 775 J |
+| gv1: only lanes with a survivor gather pass bits (one `__byte_perm` + 2 ops per x-step instead of ~6) | gv1 1908 -> 1746 | 778 -> 768 J |
+| noise kernels: permutation-pair table doubled to 512 entries, so `byte + (index & 0xFF)` needs no mask (6 fewer ops per cell) | 2_01a 1715 -> 1645 | level (±1%) |
+Rejected: octave-0-only early reject of 2_01a inputs with |octave 1| <= 1.1 vf1 would reject only 0.09% of inputs.
+Note: from 2026-11-07 ~20:00 another agent ran CPU-heavy jobs on the node (no GPU use); A/B rounds alternate, so differences under ~1% are noise.
+
+, 60 s, 2 pipelines): HEAD 14.0 G/s vs 18.0 G/s (+29%).
+Work per iteration (thread-instructions, ncu): filter_seeds 38.5 G (39%), 2_01a 32.7 G (33%), gv1 21.9 G (22%: build 3.3 G),
+everything else ~6%.
+
+### Real throughput, normal power (2026-11-07 20:30, tools/e2e.sh, 60 s, 2 pipelines, 3 rounds each)
+perf HEAD 27.78 / 27.77 / 28.02 G seeds/s vs today's build 37.45 / 37.41 / 37.34: **+34.3%**.
+Fixed work (1 pipeline, 512 it): total 5080 -> 3790 ms (−25%): seeds 1586 -> 1467, gv1 1882 -> 963,
+2_01a 1026 -> 904, gv2 226 -> 99. Louis (2026-11-07): judge changes by speed, not energy.
+
+### Filter changes allowed (Louis, 2026-11-07), judged by tools/records.sh
+Rule: a change that alters what gets filtered must still find every record on the SB sheet
+(tools/records/sb.tsv, 38 islands; #3 has a z sign typo in the sheet): reject if it misses 1 of the
+top 25 or 2 or more overall. Baseline (current build): 38/38. Second check: our own 99 finds
+(tools/records/sb-own.tsv), baseline 99/99. Removed the host-side "duplicate island" filter: it
+printed only the first of several candidates of one island, which can measure differently (#6:
+11848688 / 11822080 / 12042944). tools/search_log.py now merges them into one line with the largest.
+
+| change | sheet | own finds | real speed (60 s, 2 pipelines, 3 rounds) |
+|---|---|---|--:|
+| filter_seeds threshold | — | — | no slack: record scores reach 0.0376 of 0.038 |
+| gv1 final -18.5 -> -18.25 | not run | not run | 37.28 -> 39.46 G/s (+5.9%) |
+| **gv1 final -18.5 -> -18.0 (ADOPTED)** | **38/38** | 95/99 (misses 10.37M, 10.16M, 10.13M, 10.04M) | **41.52 G/s (+11.4%)** |
+| gv1 final -17.5 | 36/38 (#7, #9): reject | | |
+| gv1 final -17.0 | 35/38: reject | | |
+| gv1 only even x / even z cells (4x fewer cells) | 20/38: reject | | |
+
+### Where it stands (2026-11-07)
+Work per seed is now the binding quantity (power cap). Per-iteration thread-instructions: filter_seeds ~37 G
+(~123 of its ~140/seed is test 1 + loop, and an op-by-op tally of the RNG steps gives ~99 of the ~103
+loop instructions: at the floor for this formulation), 2_01a ~32 G (per-cell setup ~70% of it, and
+every cheaper formulation tried so far lost occupancy or saved no energy), gv1 ~20 G (main loop ~3.75
+instr/candidate, build 15%).
+Remaining ideas, each estimated at ~1% or less:
+- gv1: index bytes stored as uint16 so one IADD3 adds zl to two indices (~8 ALU per x-step).
+- gv1 build: split the block by y-table so each thread owns all 4 rows of its entries (no pk re-reads,
+  8 instead of 40 float->int conversions per thread).
+- filter_seeds: test 1 without the low-word carry (superset, exact in the drain), ~2 ops/seed.
+- filter_seeds: move rotates to IMAD.WIDE on the idle FMA pipe. Doesn't reduce energy, so under the
+  power cap it is unlikely to help.
+All of this is UNCOMMITTED on purpose: Louis asked to be asked before any commit.
 
 ## Profile (ncu, baseline + gv1 change)
 - filter_seeds: SM 95% busy, 23 regs, 100% theoretical occupancy. 64-bit integer ALU bound.

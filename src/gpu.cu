@@ -421,6 +421,7 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
     XrsrRandom nr;
     nr.lo = q_lo[w][i];
     nr.hi = q_hi[w][i];
+    nr.nextInternal();  // the second state update of the a-fork, skipped in the dense pass
     filter_rest(q_seed[w][i], nr, XrsrRandomFork{q_alo[w][i], q_ahi[w][i]}, q_score[w][i], outputs);
   };
 #if SEED_ORDER_GOLDEN
@@ -443,7 +444,12 @@ __global__ __launch_bounds__(threads_per_block) void kernel(uint64_t start_seed,
     XrsrRandom nr;
     nr.lo = seed_fork.lo ^ device_chosen_continentalness_config.fork_hash.lo;
     nr.hi = seed_fork.hi ^ device_chosen_continentalness_config.fork_hash.hi;
-    const auto a_yo = noise_yo_fork(nr.fork());
+    // nr.fork() is two nextLongs. Its second state update is needed only by the ~22% of seeds
+    // that pass, so it is left to the drain (one nextInternal there) instead of done per seed.
+    XrsrRandomFork a_fork;
+    a_fork.lo = nr.nextLong();
+    a_fork.hi = XrsrRandom::rol64(nr.lo + nr.hi, 17) + nr.lo;
+    const auto a_yo = noise_yo_fork(a_fork);
     const float c_0A_yo = octave_yo_mod1<chosen_continentalness_config.octaves_a[0]>(a_yo);
     const float score = 0.35f * fabsf(c_0A_yo - 0.5f);
     const bool pass = score < 0.038f;
@@ -700,6 +706,22 @@ __device__ float device_kernel_0B[6][6][16][2];
 static_assert(sizeof(host_kernel_0B) == sizeof(device_kernel_0B));
 
 void init_conv_kernels() {
+  // The gradvecs_1 integer gate needs every gate term in [-6145/512, 0]: entries <= 0, and each
+  // gate column's worst case (sum over dnz of the most negative entry) >= -6145/512.
+  for (int dny = 0; dny < 2; ++dny) {
+    for (int dnx = 2; dnx < 4; ++dnx) {
+      double worst = 0;
+      for (int dnz = 0; dnz < 6; ++dnz) {
+        float lo = 0;
+        for (int p = 0; p < 16; ++p) {
+          if (host_kernel_0A[dny][dnx][dnz][p] > 0) { std::fprintf(stderr, "kernel_0A entry > 0\n"); std::abort(); }
+          lo = std::min(lo, host_kernel_0A[dny][dnx][dnz][p]);
+        }
+        worst += lo;
+      }
+      if (worst < -6145.0 / 512) { std::fprintf(stderr, "kernel_0A gate column out of range\n"); std::abort(); }
+    }
+  }
   float temp_0A[6][6][16][2];
   for (int dny = 0; dny < 2; ++dny) {
     for (int dnx = 0; dnx < 6; ++dnx) {
@@ -728,8 +750,16 @@ void init_conv_kernels() {
   TRY_CUDA(cudaMemcpy(device_kernel_0B_addr, temp_0B, sizeof(temp_0B), cudaMemcpyHostToDevice));
 }
 
-constexpr float kGradVecs1PrefilterThreshold = -12.0f;
-constexpr float kGradVecs1FinalThreshold      = -18.5f;
+// Funnel thresholds. Overridable at build time only for experiments (tools/records.sh checks a
+// change against the known record islands). GV1_FINAL is tightened from upstream; see PERF_LEDGER.
+#ifndef GV1_GATE
+#define GV1_GATE -12.0f
+#endif
+#ifndef GV1_FINAL
+#define GV1_FINAL -18.0f  // upstream -18.5; -18.0 keeps all 38 SB sheet records (tools/records.sh), +11% speed
+#endif
+constexpr float kGradVecs1PrefilterThreshold = GV1_GATE;
+constexpr float kGradVecs1FinalThreshold      = GV1_FINAL;
 
 constexpr float kGradVecs2PrefilterThreshold = -13.5f;
 constexpr float kGradVecs2FinalThreshold      = -20.0f;
@@ -765,37 +795,50 @@ __device__ __forceinline__ float score_full_12(
 }
 
 namespace KernelFilterGradVecs1 {
-constexpr uint32_t conv_rows = 512; // gate tables duplicated: row index v + nz <= 510 needs no mask
+// Integer gate pre-check. All four gate terms (conv columns 2 and 3 of kernel_0A, both y rows)
+// are sums of 6 non-positive kernel entries, so x in [-12.003, 0]. A second copy of those
+// columns stores q = floor(-512 x) as uint16 (<= 6145): -q/512 >= x, an upper bound (scaling by
+// 512 is exact in fp32). The exact gate is the fp32 sum of the x's, which is <= sum(x) + 3 half-
+// ulps (< 2e-6 at magnitude < 16). So if it is >= -12, then sum(-q/512) >= -12 - 2e-6, i.e. the
+// integer Q = sum(q) <= 6144. Testing Q <= 6144 therefore passes every candidate the exact gate
+// passes; the survivors are re-checked exactly in fp32, so the output is unchanged
+// (init_conv_kernels checks the range assumption at startup).
+// Each thread handles 4 z-rows, zl + 64m (m = 0..3), and half of the x range (the block's two
+// 64-thread halves split nx). A table entry packs the q's of all 4 rows: {col2 rows 0,1 | col2
+// rows 2,3 | col3 rows 0,1 | col3 rows 2,3}, two uint16 lanes per word. So one 16-byte load per
+// index serves 4 candidates, and one IADD3 adds three terms for two candidates (Q <= 24580 per
+// lane, no carry between lanes). Adding 0x7FFF - 6144 sets a lane's bit 15 exactly when it
+// fails, so ANDing the words of 8 x-steps answers "did anything pass" with no per-candidate mask.
+constexpr uint32_t kGateQ = (uint32_t)(-512.0f * kGradVecs1PrefilterThreshold);  // 6144 for -12
+constexpr uint32_t kGateBias = (0x7FFFu - kGateQ) * 0x10001u;        // per 16-bit lane
+constexpr uint32_t q_rows = 319;  // index v + zl <= 255 + 63
 
-// Conv tables are column-major: within a warp the row index is v + nz with v warp-uniform and
-// nz = lane, so loads are unit-stride across lanes (row-major [513][6] put lanes 24 B apart, a
-// 2-way bank conflict). Gate columns 2 and 3 are packed as float2: candidate c needs column 2
-// at w[c+2] and column 3 at w[c+3], so one 8-byte load serves two candidates, and the last load
-// of a group of 8 is carried into the next group (one load per y-row per candidate).
-// Each thread handles ZPT z-rows spaced 256/ZPT apart: the index v + nz is unpacked once and the
-// other rows are the same register plus a compile-time immediate. The full-score columns are
-// read only after the gate (0.17% of candidates), so they keep a single 256-row copy with a
-// masked index, and the conv-kernel table is read from global memory (L1) during the per-seed
-// build. That brings shared memory to ~17 KB per block (5 blocks/SM). Summation order is that
-// of upstream's score_center_2x2 / score_full_12.
-template <uint32_t ZPT>
-__global__ __launch_bounds__(256 / ZPT, 5) void kernel(
+// Summation order of the exact path is that of upstream's score_center_2x2 / score_full_12.
+__global__ __launch_bounds__(128, 4) void kernel(
     const InputBuffer<uint64_t> seeds,
     OutputBuffer<SeedPos> outputs,
     const KernelSeed1::Result* __restrict__ results)
 {
-  constexpr uint32_t T = 256 / ZPT;  // threads per block = z stride between a thread's rows
   __shared__ alignas(16) ImprovedNoise oct_0A;
-  // Full-score columns are read only on the 0.17% gate-pass path: one 256-row copy, masked index.
+  // Exact columns, read only on the gate-pass path (~0.2%): one 256-row copy, masked index.
   // The conv-kernel table is read only in the per-seed build, from global through L1.
   __shared__ float conv0[4][256];
   __shared__ float conv1[4][256];
   const float (&shared_kernel_0A)[6][6][16][2] = device_kernel_0A;
-  __shared__ float2 pk0[conv_rows];
-  __shared__ float2 pk1[conv_rows];
+  __shared__ float2 pk0[256];   // exact (col2, col3)
+  __shared__ float2 pk1[256];
+  __shared__ uint4 hk0[q_rows];
+  __shared__ uint4 hk1[q_rows];
   __shared__ alignas(16) uint8_t idx_xy[2][272];
+  // Fast-gate survivors (x | z << 16), re-checked exactly 32 at a time: per warp-step some lane
+  // almost always has one (32 lanes x 32 candidates at ~0.2%), so checking them in place would
+  // run the divergent exact path on most steps.
+  __shared__ uint32_t queue[4][64];
 
   const uint32_t t = threadIdx.x;
+  const uint32_t lane = t & 31, w = t >> 5;
+  const uint32_t zl = t & 63;           // z-rows zl, zl+64, zl+128, zl+192
+  const int32_t nx0 = (t >> 6) * 128;   // this half's x range [nx0, nx0 + 128)
 
   const uint32_t seeds_len = *seeds.len;
   for (uint32_t seed_index = blockIdx.x; seed_index < seeds_len; seed_index += gridDim.x) {
@@ -807,8 +850,8 @@ __global__ __launch_bounds__(256 / ZPT, 5) void kernel(
 
     const int32_t ny = oct_0A.yo;
 #pragma unroll
-    for (uint32_t k = 0; k < ZPT; ++k) {
-      const uint32_t nz = t + k * T;
+    for (uint32_t k = 0; k < 2; ++k) {
+      const uint32_t nz = t + k * 128;
       uint32_t p_z[6];
 #pragma unroll
       for (int32_t dnz = 0; dnz < 6; ++dnz) p_z[dnz] = oct_0A.p[(nz + dnz) & 0xFF] & 0xF;
@@ -823,17 +866,10 @@ __global__ __launch_bounds__(256 / ZPT, 5) void kernel(
         }
         c0[dnx] = a0; c1[dnx] = a1;
       }
-#pragma unroll
-      for (uint32_t copy = 0; copy < 2; ++copy) {
-        const uint32_t r = nz + copy * 256;
-        if (copy == 0)
-        {
-        conv0[0][r] = c0[0]; conv0[1][r] = c0[1]; conv0[2][r] = c0[4]; conv0[3][r] = c0[5];
-        conv1[0][r] = c1[0]; conv1[1][r] = c1[1]; conv1[2][r] = c1[4]; conv1[3][r] = c1[5];
-        }
-        pk0[r] = make_float2(c0[2], c0[3]);
-        pk1[r] = make_float2(c1[2], c1[3]);
-      }
+      conv0[0][nz] = c0[0]; conv0[1][nz] = c0[1]; conv0[2][nz] = c0[4]; conv0[3][nz] = c0[5];
+      conv1[0][nz] = c1[0]; conv1[1][nz] = c1[1]; conv1[2][nz] = c1[4]; conv1[3][nz] = c1[5];
+      pk0[nz] = make_float2(c0[2], c0[3]);
+      pk1[nz] = make_float2(c1[2], c1[3]);
       const uint8_t idx_x = oct_0A.p[nz];
       const uint8_t v0 = oct_0A.p[(idx_x + ny) & 0xFF];
       const uint8_t v1 = oct_0A.p[(idx_x + ny + 1) & 0xFF];
@@ -841,24 +877,64 @@ __global__ __launch_bounds__(256 / ZPT, 5) void kernel(
       idx_xy[1][nz] = v1;
       if (nz < 6) { idx_xy[0][256 + nz] = v0; idx_xy[1][256 + nz] = v1; }
     }
+    __syncthreads();
+    for (uint32_t r = t; r < q_rows; r += 128) {
+      auto q = [](float x) { return (uint32_t)floorf(-512.0f * x); };
+      auto entry = [&](const float2 (&pk)[256]) {
+        const float2 a = pk[r & 0xFF], b = pk[(r + 64) & 0xFF], c = pk[(r + 128) & 0xFF], d = pk[(r + 192) & 0xFF];
+        return make_uint4(q(a.x) | q(b.x) << 16, q(c.x) | q(d.x) << 16,
+                          q(a.y) | q(b.y) << 16, q(c.y) | q(d.y) << 16);
+      };
+      hk0[r] = entry(pk0);
+      hk1[r] = entry(pk1);
+    }
 
     const int32_t cell_size = 512 * large_biomes_pos_mul;
     const int32_t x_center = (2.5f - oct_0A.xo) * cell_size;
     const int32_t z_center = (2.5f - oct_0A.zo) * cell_size;
     __syncthreads();
 
-    uchar4 c0_0 = *reinterpret_cast<const uchar4*>(&idx_xy[0][0]);
-    uchar4 c0_1 = *reinterpret_cast<const uchar4*>(&idx_xy[0][4]);
-    uchar4 c1_0 = *reinterpret_cast<const uchar4*>(&idx_xy[1][0]);
-    uchar4 c1_1 = *reinterpret_cast<const uchar4*>(&idx_xy[1][4]);
-
-    float2 carry0[ZPT], carry1[ZPT];  // g[8] of a group (index nx+10) is g[0] of the next
-#pragma unroll
-    for (uint32_t k = 0; k < ZPT; ++k) {
-      carry0[k] = pk0[idx_xy[0][2] + t + k * T];
-      carry1[k] = pk1[idx_xy[1][2] + t + k * T];
-    }
-    for (int32_t nx = 0; nx < 256; nx += 8) {
+    uchar4 c0_0 = *reinterpret_cast<const uchar4*>(&idx_xy[0][nx0]);
+    uchar4 c0_1 = *reinterpret_cast<const uchar4*>(&idx_xy[0][nx0 + 4]);
+    uchar4 c1_0 = *reinterpret_cast<const uchar4*>(&idx_xy[1][nx0]);
+    uchar4 c1_1 = *reinterpret_cast<const uchar4*>(&idx_xy[1][nx0 + 4]);
+    // Exact fp32 gate (same terms and order as before), then upstream's full score.
+    auto check = [&](uint32_t entry) {
+      const int32_t x = entry & 0xFFFF;
+      const uint32_t z = entry >> 16;
+      const uint8_t *i0 = &idx_xy[0][x], *i1 = &idx_xy[1][x];
+      const float a2 = pk0[(i0[2] + z) & 0xFF].x, a3 = pk0[(i0[3] + z) & 0xFF].y;
+      const float b2 = pk1[(i1[2] + z) & 0xFF].x, b3 = pk1[(i1[3] + z) & 0xFF].y;
+      const float gate = a2 + a3 + b2 + b3;
+      if (gate >= kGradVecs1PrefilterThreshold) {
+        float score = 0.0f;
+        score += conv0[0][(i0[0] + z) & 0xFF];
+        score += conv1[0][(i1[0] + z) & 0xFF];
+        score += conv0[1][(i0[1] + z) & 0xFF];
+        score += conv1[1][(i1[1] + z) & 0xFF];
+        score += a2;
+        score += b2;
+        score += a3;
+        score += b3;
+        score += conv0[2][(i0[4] + z) & 0xFF];
+        score += conv1[2][(i1[4] + z) & 0xFF];
+        score += conv0[3][(i0[5] + z) & 0xFF];
+        score += conv1[3][(i1[5] + z) & 0xFF];
+        if (score > kGradVecs1FinalThreshold) {
+          const uint32_t res_idx = atomicAdd(outputs.len, 1);
+          if (res_idx < outputs.max_len) {
+            outputs.data[res_idx] = {seed_index, x_center + x * cell_size, z_center + (int32_t)z * cell_size};
+          }
+        }
+      }
+    };
+    uint32_t qn = 0;  // warp-uniform queue length
+#ifdef GV1_BUILD_ONLY
+    if (seeds_len) continue;
+#endif
+    uint4 carry0 = hk0[idx_xy[0][nx0 + 2] + zl];  // e[8] of a group (index nx+10) is e[0] of the next
+    uint4 carry1 = hk1[idx_xy[1][nx0 + 2] + zl];
+    for (int32_t nx = nx0; nx < nx0 + 128; nx += 8) {
       // one 8-byte load per row brings the next 8 index bytes (nx+8 .. nx+15)
       const uint2 n0 = *reinterpret_cast<const uint2*>(&idx_xy[0][nx + 8]);
       const uint2 n1 = *reinterpret_cast<const uint2*>(&idx_xy[1][nx + 8]);
@@ -866,55 +942,56 @@ __global__ __launch_bounds__(256 / ZPT, 5) void kernel(
       const uchar4 c1_2 = *reinterpret_cast<const uchar4*>(&n1.x), c1_3 = *reinterpret_cast<const uchar4*>(&n1.y);
       const uint8_t r0[13] = {c0_0.x, c0_0.y, c0_0.z, c0_0.w, c0_1.x, c0_1.y, c0_1.z, c0_1.w, c0_2.x, c0_2.y, c0_2.z, c0_2.w, c0_3.x};
       const uint8_t r1[13] = {c1_0.x, c1_0.y, c1_0.z, c1_0.w, c1_1.x, c1_1.y, c1_1.z, c1_1.w, c1_2.x, c1_2.y, c1_2.z, c1_2.w, c1_3.x};
-      uint32_t w0[13], w1[13];
-#pragma unroll
-      for (int j = 0; j < 13; ++j) { w0[j] = r0[j] + t; w1[j] = r1[j] + t; }
 
+      uint4 e0[9], e1[9];
+      e0[0] = carry0;
+      e1[0] = carry1;
 #pragma unroll
-      for (uint32_t k = 0; k < ZPT; ++k) {
-        const uint32_t off = k * T;  // compile-time row offset
-        float2 g0[9], g1[9];
-        g0[0] = carry0[k];
-        g1[0] = carry1[k];
+      for (int j = 1; j < 9; ++j) { e0[j] = hk0[r0[j + 2] + zl]; e1[j] = hk1[r1[j + 2] + zl]; }
+      carry0 = e0[8];
+      carry1 = e1[8];
+      uint32_t fail[8][2], all_fail = 0xFFFFFFFFu;  // [c][0]: rows m=0,1 in bits 15, 31; [c][1]: m=2,3
 #pragma unroll
-        for (int j = 1; j < 9; ++j) { g0[j] = pk0[w0[j + 2] + off]; g1[j] = pk1[w1[j + 2] + off]; }
-        carry0[k] = g0[8];
-        carry1[k] = g1[8];
-        uint32_t pass_mask = 0;
-#pragma unroll
-        for (int c = 0; c < 8; ++c) {
-          const float gate = g0[c].x + g0[c + 1].y + g1[c].x + g1[c + 1].y;
-          pass_mask |= (gate >= kGradVecs1PrefilterThreshold ? 1u : 0u) << c;
-        }
-        if (__any_sync(0xFFFFFFFFu, pass_mask != 0)) {
+      for (int c = 0; c < 8; ++c) {
+        fail[c][0] = e0[c].x + e0[c + 1].z + e1[c].x + e1[c + 1].z + kGateBias;
+        fail[c][1] = e0[c].y + e0[c + 1].w + e1[c].y + e1[c + 1].w + kGateBias;
+        all_fail &= fail[c][0] & fail[c][1];
+      }
+      if (__any_sync(0xFFFFFFFFu, (all_fail & 0x80008000u) != 0x80008000u)) {
+        // Gather this lane's pass bits (bit 8m + c) and push them onto the warp's queue;
+        // kept compact so the hot loop stays in the instruction cache.
+        // Only the lanes that have a survivor (usually 1-2 of 32) gather bits.
+        uint32_t bits = 0;
+        if ((all_fail & 0x80008000u) != 0x80008000u) {
 #pragma unroll
           for (int c = 0; c < 8; ++c) {
-            if (pass_mask & (1u << c)) {
-              float score = 0.0f;
-              score += conv0[0][(w0[c] + off) & 0xFF];
-              score += conv1[0][(w1[c] + off) & 0xFF];
-              score += conv0[1][(w0[c + 1] + off) & 0xFF];
-              score += conv1[1][(w1[c + 1] + off) & 0xFF];
-              score += g0[c].x;
-              score += g1[c].x;
-              score += g0[c + 1].y;
-              score += g1[c + 1].y;
-              score += conv0[2][(w0[c + 4] + off) & 0xFF];
-              score += conv1[2][(w1[c + 4] + off) & 0xFF];
-              score += conv0[3][(w0[c + 5] + off) & 0xFF];
-              score += conv1[3][(w1[c + 5] + off) & 0xFF];
-              if (score > kGradVecs1FinalThreshold) {
-                const uint32_t res_idx = atomicAdd(outputs.len, 1);
-                if (res_idx < outputs.max_len) {
-                  outputs.data[res_idx] = {seed_index, x_center + (nx + c) * cell_size, z_center + (int32_t)(t + off) * cell_size};
-                }
-              }
-            }
+            // fail flags for m = 0..3 sit in the top bits of bytes 1 and 3 of each word
+            const uint32_t f = __byte_perm(fail[c][0], fail[c][1], 0x7531);
+            bits |= ((~f & 0x80808080u) >> (7 - c));  // bit 8m + c
+          }
+        }
+#pragma unroll 1
+        while (__any_sync(0xFFFFFFFFu, bits != 0)) {
+          const bool has = bits != 0;
+          const uint32_t b = __ffs(bits) - 1;
+          bits &= bits - 1;
+          const uint32_t ball = __ballot_sync(0xFFFFFFFFu, has);
+          if (has) {
+            queue[w][qn + __popc(ball & ((1u << lane) - 1u))] = (uint32_t)(nx + (b & 7)) | (zl + 64 * (b >> 3)) << 16;
+          }
+          qn += __popc(ball);
+          if (qn >= 32) {
+            __syncwarp();
+            check(queue[w][qn - 32 + lane]);
+            qn -= 32;
+            __syncwarp();
           }
         }
       }
       c0_0 = c0_2; c0_1 = c0_3; c1_0 = c1_2; c1_1 = c1_3;
     }
+    __syncwarp();
+    if (lane < qn) check(queue[w][lane]);
   }
 }
 void run(
@@ -923,7 +1000,7 @@ void run(
     const KernelSeed1::Result* __restrict__ results,
     cudaStream_t stream)
 {
-  kernel<2><<<2048, 128, 0, stream>>>(seeds, outputs, results);
+  kernel<<<2048, 128, 0, stream>>>(seeds, outputs, results);
   TRY_CUDA(cudaGetLastError());
 }
 } // namespace KernelFilterGradVecs1
@@ -943,8 +1020,13 @@ __launch_bounds__(block_dim_x) void kernel(
   __shared__ alignas(16) ImprovedNoise oct_0B;
   __shared__ alignas(16) float shared_kernel_0B[6][6][16][2];
 
-  __shared__ float conv_z0[513][6];
-  __shared__ float conv_z1[513][6];
+  // Column-major conv tables (lanes read unit-stride: conflict-free), rows duplicated so
+  // row index + nz (<= 510) needs no mask.
+  __shared__ float conv_t0[6][512];
+  __shared__ float conv_t1[6][512];
+  // The 12 permutation indices of each grid column tx, built once per input instead of by every
+  // thread at every tx (18 shared loads per step before; now one broadcast 16-byte load).
+  __shared__ alignas(16) uint8_t s_idx[grid_width][16];
 
   for (uint32_t i = threadIdx.x; i < 288; i += blockDim.x) {
     reinterpret_cast<uint4*>(shared_kernel_0B)[i] =
@@ -987,54 +1069,54 @@ __launch_bounds__(block_dim_x) void kernel(
           conv1 += shared_kernel_0B[dnx][dnz][p][1];
         }
 
-        conv_z0[V][dnx] = conv0;
-        conv_z1[V][dnx] = conv1;
-        conv_z0[V + 256][dnx] = conv0;
-        conv_z1[V + 256][dnx] = conv1;
+        conv_t0[dnx][V] = conv0;
+        conv_t1[dnx][V] = conv1;
+        conv_t0[dnx][V + 256] = conv0;
+        conv_t1[dnx][V + 256] = conv1;
       }
     }
 
-    __syncthreads();
-
     const int32_t ny = oct_0B.yo;
-
-    for (uint32_t tx = 0; tx < grid_width; ++tx) {
-      const int32_t tile_dx = ((int32_t)tx - grid_half_s) * cell_size_0A;
-      const int32_t x = input.x + tile_dx;
+    for (uint32_t tx = threadIdx.x; tx < grid_width; tx += blockDim.x) {
+      const int32_t x = input.x + ((int32_t)tx - grid_half_s) * cell_size_0A;
       const int32_t nx = __float2int_rd(x * input_factor_b + oct_0B.xo - 2.0f);
-
-      int32_t hoisted_idx_xy[2][6];
+      uint32_t w[3] = {0, 0, 0};
 #pragma unroll
       for (int32_t dnx = 0; dnx < 6; ++dnx) {
         const int32_t idx_x = oct_0B.p[(nx + dnx) & 0xFF];
 #pragma unroll
         for (int32_t dny = 0; dny < 2; ++dny) {
-          hoisted_idx_xy[dny][dnx] = oct_0B.p[(idx_x + ny + dny) & 0xFF];
+          const uint32_t byte = dny * 6 + dnx;
+          w[byte / 4] |= (uint32_t)oct_0B.p[(idx_x + ny + dny) & 0xFF] << (8 * (byte % 4));
         }
       }
+      *reinterpret_cast<uint4*>(s_idx[tx]) = make_uint4(w[0], w[1], w[2], 0);
+    }
 
-      for (uint32_t tz = threadIdx.x; tz < grid_width; tz += blockDim.x) {
-        const int32_t tile_dz = ((int32_t)tz - grid_half_s) * cell_size_0A;
-        const int32_t z = input.z + tile_dz;
+    __syncthreads();
 
-        const int32_t nz = __float2int_rd(z * input_factor_b + oct_0B.zo - 2.0f);
-        const int32_t nz_masked = nz & 0xFF;
+    for (uint32_t tz = threadIdx.x; tz < grid_width; tz += blockDim.x) {
+      const int32_t z = input.z + ((int32_t)tz - grid_half_s) * cell_size_0A;
+      const uint32_t nz_masked = __float2int_rd(z * input_factor_b + oct_0B.zo - 2.0f) & 0xFF;
 
-        int32_t idx0[6];
-        int32_t idx1[6];
-#pragma unroll
-        for (int32_t i = 0; i < 6; ++i) {
-          idx0[i] = hoisted_idx_xy[0][i] + nz_masked;
-          idx1[i] = hoisted_idx_xy[1][i] + nz_masked;
-        }
-
-        const float gate = score_center_2x2(conv_z0, conv_z1, idx0, idx1);
+      for (uint32_t tx = 0; tx < grid_width; ++tx) {
+        const uint4 wv = *reinterpret_cast<const uint4*>(s_idx[tx]);
+        const uint32_t ww[3] = {wv.x, wv.y, wv.z};
+        auto i0 = [&](int d) { return ((ww[d / 4] >> (8 * (d % 4))) & 0xFF) + nz_masked; };
+        auto i1 = [&](int d) { return ((ww[(d + 6) / 4] >> (8 * ((d + 6) % 4))) & 0xFF) + nz_masked; };
+        // upstream's score_center_2x2 order
+        const float gate = conv_t0[2][i0(2)] + conv_t0[3][i0(3)] + conv_t1[2][i1(2)] + conv_t1[3][i1(3)];
         if (gate >= kGradVecs2PrefilterThreshold) {
-          const float score = score_full_12(conv_z0, conv_z1, idx0, idx1);
+          float score = 0.0f;  // upstream's score_full_12 order
+#pragma unroll
+          for (int i = 0; i < 6; ++i) {
+            score += conv_t0[i][i0(i)];
+            score += conv_t1[i][i1(i)];
+          }
           if (score > kGradVecs2FinalThreshold) {
             uint32_t result_index = atomicAdd(outputs.len, 1);
             if (result_index < outputs.max_len) {
-              outputs.data[result_index] = {input.seed_index, x, z};
+              outputs.data[result_index] = {input.seed_index, input.x + ((int32_t)tx - grid_half_s) * cell_size_0A, z};
             }
           }
         }
@@ -1292,7 +1374,7 @@ void Template<NoiseThreshold, Octaves, PosRange, Samples, MinCount, FlippedSpars
 // cell comes as an (i, i+1) pair, so a cell needs 7 shared loads instead of 14 (filter_2_01a/b are
 // LSU-issue bound). Built by each warp from the global ImprovedNoise in the copy it already does.
 struct alignas(16) PairNoise {
-  uint16_t q[256];
+  uint16_t q[512];  // q[i + 256] = q[i]: byte + (index & 0xFF) <= 510 needs no mask
   float xo, yo, zo, pad;
 };
 
@@ -1305,18 +1387,20 @@ __device__ __forceinline__ void load_pairs(PairNoise &dst, const ImprovedNoise &
   out.z = __byte_perm(w1, w2, 0x2110);
   out.w = __byte_perm(w1, w2, 0x4332);
   reinterpret_cast<uint4 *>(dst.q)[lane] = out;
+  reinterpret_cast<uint4 *>(dst.q)[lane + 32] = out;
   if (lane < 3) (&dst.xo)[lane] = (&src.xo)[lane];
 }
 
 __device__ __forceinline__ void compute_cell_q(const PairNoise &noise, int32_t int_x, int32_t int_y, int32_t int_z,
     uint8_t &c000, uint8_t &c100, uint8_t &c010, uint8_t &c110, uint8_t &c001, uint8_t &c101, uint8_t &c011, uint8_t &c111) {
+  const uint32_t iy = int_y & 0xFF, iz = int_z & 0xFF;  // byte + iy <= 510: the table is doubled
   const uint32_t a = noise.q[int_x & 0xFF];
-  const uint32_t b0 = noise.q[((a & 0xFF) + int_y) & 0xFF];
-  const uint32_t b1 = noise.q[((a >> 8) + int_y) & 0xFF];
-  const uint32_t k00 = noise.q[((b0 & 0xFF) + int_z) & 0xFF];
-  const uint32_t k01 = noise.q[((b0 >> 8) + int_z) & 0xFF];
-  const uint32_t k10 = noise.q[((b1 & 0xFF) + int_z) & 0xFF];
-  const uint32_t k11 = noise.q[((b1 >> 8) + int_z) & 0xFF];
+  const uint32_t b0 = noise.q[(a & 0xFF) + iy];
+  const uint32_t b1 = noise.q[(a >> 8) + iy];
+  const uint32_t k00 = noise.q[(b0 & 0xFF) + iz];
+  const uint32_t k01 = noise.q[(b0 >> 8) + iz];
+  const uint32_t k10 = noise.q[(b1 & 0xFF) + iz];
+  const uint32_t k11 = noise.q[(b1 >> 8) + iz];
   c000 = k00 & 0xFF; c001 = k00 >> 8;
   c010 = k01 & 0xFF; c011 = k01 >> 8;
   c100 = k10 & 0xFF; c101 = k10 >> 8;
@@ -1407,48 +1491,133 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
     const float frac_z1 = z1c - (float)int_z1;
     const float fz1 = smoothstep(frac_z1);
 
-    int32_t cur_ix0 = 0;
-    int32_t cur_ix1 = 0;
-    bool have0 = false;
-    bool have1 = false;
-    uint8_t a000, a100, a010, a110, a001, a101, a011, a111;
-    uint8_t b000, b100, b010, b110, b001, b101, b011, b111;
+    // Exact count: upstream's evaluation, bit for bit. Used only when the fast count below
+    // cannot decide (practically never).
+    auto exact_count = [&]() {
+      int32_t cur_ix0 = 0;
+      int32_t cur_ix1 = 0;
+      bool have0 = false;
+      bool have1 = false;
+      uint8_t a000, a100, a010, a110, a001, a101, a011, a111;
+      uint8_t b000, b100, b010, b110, b001, b101, b011, b111;
 
-    uint32_t local_count = 0;
+      uint32_t local_count = 0;
+  #pragma unroll
+      for (uint32_t k = 0; k < 8; k++) {
+        const int32_t x_world = x_base + (int32_t)(k * T::pos_step);
+
+        const float x0c = x_world * if0 + oct0.xo;
+        const int32_t int_x0 = __float2int_rd(x0c);
+        const float frac_x0 = x0c - (float)int_x0;
+        if (!have0 || int_x0 != cur_ix0) {
+          compute_cell_q(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
+          cur_ix0 = int_x0;
+          have0 = true;
+        }
+        const float fx0 = smoothstep(frac_x0);
+        const float noise0 = interp(shared_grad_dot_table, frac_x0, frac_y0, frac_z0, fx0, fy0, fz0, a000, a100, a010, a110, a001, a101, a011, a111);
+
+        const float x1c = x_world * if1 + oct1.xo;
+        const int32_t int_x1 = __float2int_rd(x1c);
+        const float frac_x1 = x1c - (float)int_x1;
+        if (!have1 || int_x1 != cur_ix1) {
+          compute_cell_q(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
+          cur_ix1 = int_x1;
+          have1 = true;
+        }
+        const float fx1 = smoothstep(frac_x1);
+        const float noise1 = interp(shared_grad_dot_table, frac_x1, frac_y1, frac_z1, fx1, fy1, fz1, b000, b100, b010, b110, b001, b101, b011, b111);
+
+        float val = 0;
+        val += noise0 * vf0;
+        val += noise1 * vf1;
+
+        local_count += (val < T::noise_threshold) ? 1u : 0u;
+      }
+      return local_count;
+    };
+
+    // Fast count. Inside one noise cell, with y and z fixed per lane, the trilinear noise is
+    //   n = A0 + fx * (A1 - A0),  A_i = gxbar_i * frac_x + c_i   (fx = smoothstep(frac_x)),
+    // the same real-valued function with the y/z lerps folded into per-cell coefficients
+    // (weights W_jk = w_j(fy) w_k(fz), octave weight folded in). frac and the smoothstep values
+    // are computed exactly as upstream, so the two evaluations differ only by fp32 rounding in
+    // the lerps and gradient dots: < 200 u per octave (u = 2^-24; |gradient dot| <= 4, convex
+    // weights), < 3e-5 for the sum. With eps = 2^-12, a fast value < thr - eps is surely below
+    // the threshold upstream and one >= thr + eps surely not.
+    constexpr float eps = 1.0f / 4096.0f;
+    const float wy0[2] = {1.0f - fy0, fy0}, wz0[2] = {1.0f - fz0, fz0};
+    const float wy1[2] = {1.0f - fy1, fy1}, wz1[2] = {1.0f - fz1, fz1};
+    const float ty0[2] = {frac_y0, frac_y0 - 1.0f}, tz0[2] = {frac_z0, frac_z0 - 1.0f};
+    const float ty1[2] = {frac_y1, frac_y1 - 1.0f}, tz1[2] = {frac_z1, frac_z1 - 1.0f};
+    // Per-cell coefficients for one octave: corners c[i][j][k] (x, y, z).
+    auto coeffs = [&](const uint8_t (&c)[2][2][2], const float (&wy)[2], const float (&wz)[2],
+                      const float (&ty)[2], const float (&tz)[2], float vf, float4 &k) {
+      float g[2], cc[2];
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        float gs = 0.0f, cs = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+#pragma unroll
+          for (int kz = 0; kz < 2; ++kz) {
+            const uint32_t w = shared_grad_dot_table.g[c[i][j][kz] & 0xF];
+            const float gx = __uint_as_float(__byte_perm(w, 0, 0x0444));
+            const float gy = __uint_as_float(__byte_perm(w, 0, 0x1444));
+            const float gz = __uint_as_float(__byte_perm(w, 0, 0x2444));
+            const float W = wy[j] * wz[kz];
+            gs = fmaf(W, gx, gs);
+            cs = fmaf(W, fmaf(gy, ty[j], gz * tz[kz]), cs);
+          }
+        }
+        g[i] = gs * vf; cc[i] = cs * vf;
+      }
+      k = make_float4(g[0], cc[0], g[1], cc[1] - g[1]);  // A1 = g1 * (frac - 1) + c1
+    };
+
+    int32_t fx_ix0 = 0, fx_ix1 = 0;
+    bool fhave0 = false, fhave1 = false;
+    float4 k0 = {}, k1 = {};
+    uint32_t packed = 0;  // low 16 bits: surely below; high 16 bits: possibly below
 #pragma unroll
     for (uint32_t k = 0; k < 8; k++) {
       const int32_t x_world = x_base + (int32_t)(k * T::pos_step);
-
       const float x0c = x_world * if0 + oct0.xo;
       const int32_t int_x0 = __float2int_rd(x0c);
       const float frac_x0 = x0c - (float)int_x0;
-      if (!have0 || int_x0 != cur_ix0) {
-        compute_cell_q(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
-        cur_ix0 = int_x0;
-        have0 = true;
+      if (!fhave0 || int_x0 != fx_ix0) {
+        uint8_t c[2][2][2];
+        compute_cell_q(oct0, int_x0, int_y0, int_z0, c[0][0][0], c[1][0][0], c[0][1][0], c[1][1][0], c[0][0][1], c[1][0][1], c[0][1][1], c[1][1][1]);
+        coeffs(c, wy0, wz0, ty0, tz0, vf0, k0);
+        fx_ix0 = int_x0;
+        fhave0 = true;
       }
       const float fx0 = smoothstep(frac_x0);
-      const float noise0 = interp(shared_grad_dot_table, frac_x0, frac_y0, frac_z0, fx0, fy0, fz0, a000, a100, a010, a110, a001, a101, a011, a111);
+      const float a00 = fmaf(k0.x, frac_x0, k0.y), a01 = fmaf(k0.z, frac_x0, k0.w);
+      const float n0 = fmaf(fx0, a01 - a00, a00);
 
       const float x1c = x_world * if1 + oct1.xo;
       const int32_t int_x1 = __float2int_rd(x1c);
       const float frac_x1 = x1c - (float)int_x1;
-      if (!have1 || int_x1 != cur_ix1) {
-        compute_cell_q(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
-        cur_ix1 = int_x1;
-        have1 = true;
+      if (!fhave1 || int_x1 != fx_ix1) {
+        uint8_t c[2][2][2];
+        compute_cell_q(oct1, int_x1, int_y1, int_z1, c[0][0][0], c[1][0][0], c[0][1][0], c[1][1][0], c[0][0][1], c[1][0][1], c[0][1][1], c[1][1][1]);
+        coeffs(c, wy1, wz1, ty1, tz1, vf1, k1);
+        fx_ix1 = int_x1;
+        fhave1 = true;
       }
       const float fx1 = smoothstep(frac_x1);
-      const float noise1 = interp(shared_grad_dot_table, frac_x1, frac_y1, frac_z1, fx1, fy1, fz1, b000, b100, b010, b110, b001, b101, b011, b111);
+      const float a10 = fmaf(k1.x, frac_x1, k1.y), a11 = fmaf(k1.z, frac_x1, k1.w);
+      const float n1 = fmaf(fx1, a11 - a10, a10);
 
-      float val = 0;
-      val += noise0 * vf0;
-      val += noise1 * vf1;
-
-      local_count += (val < T::noise_threshold) ? 1u : 0u;
+      const float val = n0 + n1;
+      packed += (val < T::noise_threshold - eps ? 1u : 0u) + (val < T::noise_threshold + eps ? 0x10000u : 0u);
     }
-
-    const uint32_t total = warp_reduce_add(local_count);
+    const uint32_t tot = warp_reduce_add(packed);
+    uint32_t total = tot & 0xFFFF;               // surely below
+    if ((tot >> 16) >= T::min_count && total < T::min_count) {
+      total = warp_reduce_add(exact_count());    // undecided: count exactly (warp-uniform branch)
+    }
     if (lane == 0 && total >= T::min_count) {
       uint32_t result_index = atomicAdd(outputs.len, 1);
       if (result_index < outputs.max_len){
@@ -1714,7 +1883,7 @@ void GpuThread::run() {
   std::printf("Initializing device %d\n", device);
 
   TRY_CUDA(cudaSetDevice(device));
-  TRY_CUDA(cudaFuncSetAttribute(reinterpret_cast<const void *>(&KernelFilterGradVecs1::kernel<2>), cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+  TRY_CUDA(cudaFuncSetAttribute(reinterpret_cast<const void *>(&KernelFilterGradVecs1::kernel), cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   init_grad_dot_table();
   init_conv_kernels();
 
@@ -1736,9 +1905,6 @@ void GpuThread::run() {
   // input entry another warp had not read yet. Its output is small, so it gets its own buffer.
   DeviceBuffer buffer_3(UINT32_C(1) << 26);
   std::vector<SeedPos> h_buffer;
-  std::array<GpuOutput, 64> recent_outputs{};
-  size_t recent_next = 0;
-  uint64_t deduped_outputs = 0;
   std::vector<StageStats> stage_stats;
   stage_stats.reserve(16);
 
@@ -1895,25 +2061,10 @@ void GpuThread::run() {
           uint64_t seed;
           TRY_CUDA(cudaMemcpy(&seed, &outputs_filter_seeds.data[result.seed_index], sizeof(seed), cudaMemcpyDeviceToHost));
           const GpuOutput out{seed, result.x * 4, result.z * 4};
-          // Neighbouring GPU candidates often land on the same island; verifying each one
-          // repeats the CPU work and printed duplicate lines. 1024 blocks is far inside the
-          // CPU's +-12800-block verification window, so both would get the same verdict.
-          bool duplicate = false;
-#ifndef DEDUP_RADIUS
-#define DEDUP_RADIUS 1024
-#endif
-          for (size_t r = 0; r < std::min(recent_next, recent_outputs.size()); r++) {
-            const auto &prev = recent_outputs[r];
-            if (prev.seed == out.seed && std::abs(prev.x - out.x) <= DEDUP_RADIUS && std::abs(prev.z - out.z) <= DEDUP_RADIUS) {
-              duplicate = true;
-              break;
-            }
-          }
-          if (duplicate) {
-            deduped_outputs++;
-            continue;
-          }
-          recent_outputs[recent_next++ % recent_outputs.size()] = out;
+          // Every candidate is verified and printed, as upstream does: neighbouring candidates of
+          // one island start the CPU's area measurement from different points and can report
+          // different sizes (record #6 of the SB sheet: 11848688, 11822080 and 12042944), so
+          // dropping "duplicates" could under-report an island.
           outputs.queue.push(out);
         }
       }
@@ -1974,7 +2125,7 @@ void GpuThread::run() {
         std::lock_guard lock(outputs.mutex);
         gpu_outputs_size = outputs.queue.size();
       }
-      std::printf("gpu_outputs.size() = %zu (duplicates dropped so far: %" PRIu64 ")\n", gpu_outputs_size, deduped_outputs);
+      std::printf("gpu_outputs.size() = %zu\n", gpu_outputs_size);
 
       for (auto &stage_stat : stage_stats) {
         stage_stat.reset();
