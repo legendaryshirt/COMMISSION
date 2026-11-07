@@ -6,3 +6,4 @@ main-sb*
 main-lb*
 output.txt
 search/
+__pycache__/

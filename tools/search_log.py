@@ -8,7 +8,9 @@ only what is worth keeping on disk:
     <utc> range  <type> <order> <first> <end>   logical seeds [first, end) fully searched
                                                 (checkpoint every --every s, and at exit;
                                                 later lines for the same first supersede)
-    <utc> island <type> <seed> <x> <z> <area>
+    <utc> island <type> <seed> <x> <z> <area>   one line per island: neighbouring candidates
+                                                of the same island (same seed, within 2048
+                                                blocks) are merged and the largest area kept
   search/status.json  overwritten once a minute: progress, rate inputs, latest stage table
   search/session.txt  overwritten per session: startup banner, warnings and errors
 
@@ -34,6 +36,9 @@ EVERY = float(os.environ.get("RANGE_EVERY", 300))
 STATUS_EVERY = 60
 LOG, STATUS = f"{d}/search.log", f"{d}/status.json"
 ISLAND = re.compile(r"^(-?\d+) at (-?\d+) (-?\d+) with (\d+)$")
+MERGE_BLOCKS = 2048   # candidates of one island are a few hundred blocks apart
+HOLD_SECONDS = 60     # they are verified within seconds of each other (same GPU batch)
+pending = []          # [first_seen, seed, x, z, area], written once held HOLD_SECONDS
 ROUTINE = ("start_seed = ", "filter_", "init_seeds", "total ", "gpu_outputs.")
 
 started = time.time()
@@ -70,6 +75,13 @@ def write_range():
         log.write(f"{utc()}\trange\t{typ}\t{order}\t{first}\t{e}\n")
 
 
+def flush_islands(force=False):
+    now = time.monotonic()
+    for p in [p for p in pending if force or now - p[0] >= HOLD_SECONDS]:
+        log.write(f"{utc()}\tisland\t{typ}\t{p[1]}\t{p[2]}\t{p[3]}\t{p[4]}\n")
+        pending.remove(p)
+
+
 def write_status():
     s = {"ts": time.time(), "type": typ, "order": order, "first": first,
          "started": started, "reached": reached, "end": safe_end(), "pipelines": pipes,
@@ -94,7 +106,14 @@ for line in sys.stdin:
         if name.strip() == "total":
             stages, block = block, []
     elif m := ISLAND.match(line):
-        log.write(f"{utc()}\tisland\t{typ}\t" + "\t".join(m.groups()) + "\n")
+        seed, x, z, area = (int(v) for v in m.groups())
+        for p in pending:
+            if p[1] == seed and abs(p[2] - x) <= MERGE_BLOCKS and abs(p[3] - z) <= MERGE_BLOCKS:
+                if area > p[4]:
+                    p[2:] = [x, z, area]
+                break
+        else:
+            pending.append([time.monotonic(), seed, x, z, area])
     elif line.startswith("Start seed: "):   # graceful exit: the exact end
         m = re.match(r"Start seed: (-?\d+), Total seeds checked: (\d+)", line)
         if m:
@@ -106,8 +125,11 @@ for line in sys.stdin:
     if now - last_status >= STATUS_EVERY:
         write_status()
         last_status = now
+    if pending:
+        flush_islands()
     if now - last_range >= EVERY:
         write_range()
         last_range = now
+flush_islands(force=True)
 write_range()
 write_status()
